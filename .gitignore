@@ -1,0 +1,6 @@
+*.o
+*.built
+.built
+*.dep
+Make.dep
+.depend
