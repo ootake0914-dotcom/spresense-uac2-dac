@@ -1,0 +1,24 @@
+config EXAMPLES_UAC2_DAC
+	tristate "USB Audio Class 2.0 (192kHz/24bit) DAC"
+	default n
+	depends on USBDEV
+	---help---
+		Enable the USB Audio Class 2.0 (UAC2) 192kHz/24bit High-Resolution DAC application.
+
+if EXAMPLES_UAC2_DAC
+
+config EXAMPLES_UAC2_DAC_PROGNAME
+	string "Program name"
+	default "uac2_dac"
+	---help---
+		This is the name of the program that will be used in the NSH shell.
+
+config EXAMPLES_UAC2_DAC_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_UAC2_DAC_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif
