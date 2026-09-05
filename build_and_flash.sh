@@ -86,7 +86,7 @@ enable_config "CONFIG_AUDIO"
 enable_config "CONFIG_AUDIO_CXD56"
 
 # Ensure clean rebuild of app objects
-rm -f "$APP_SRC/.built" "$SDK/apps/libapps.a" "$NUTTX/staging/libapps.a"
+rm -f "$APP_SRC/.built" "$APP_SRC"/src/*.o "$SDK/apps/libapps.a" "$NUTTX/staging/libapps.a"
 
 
 # Refresh auto-generated Kconfig (picks up uac2_dac/Kconfig via symlink) and

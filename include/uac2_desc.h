@@ -16,7 +16,7 @@
 #define UAC2_DEVICE_RELEASE_NUM       0x010D /* v1.13: Alt 0/1/2 multi-setting test */
 
 /* Alt 0 Single-Setting Streaming Mode (bypasses hardware Alt > 0 autonomous STALL) */
-#define UAC2_SINGLE_ALT0_STREAMING    0
+#define UAC2_SINGLE_ALT0_STREAMING    1
 
 /* Entity IDs (Aligned with TinyUSB UAC2 Speaker layout) */
 #define UAC2_ENTITY_INPUT_TERMINAL    0x01

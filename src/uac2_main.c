@@ -21,7 +21,7 @@ int main(int argc, char *argv[])
 {
     printf("\n=======================================================\n");
     printf(" Spresense 192kHz / 24-bit USB Audio Class 2.0 (UAC2) DAC\n");
-    printf(" FW Rev23: Alt 0/1/2 Multi-Setting Verification Test\n");
+    printf(" FW Rev24: Linux Alt0 Single-Setting Streaming\n");
     printf(" Hardware: Sony CXD5602 + CXD5247 Audio Subsystem\n");
     printf(" Mode: Dedicated USB DAC Firmware (MIDI Engine Disabled)\n");
     printf("=======================================================\n");
