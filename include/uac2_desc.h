@@ -13,10 +13,10 @@
 
 #define UAC2_VENDOR_ID                0x054C /* Sony Corporation */
 #define UAC2_PRODUCT_ID               0x0CED /* Spresense UAC2 Hi-Res DAC (Rev 20: UDC alt2 arm) */
-#define UAC2_DEVICE_RELEASE_NUM       0x010C /* v1.12: Alt 0 single-setting streaming (hardware stall bypass) */
+#define UAC2_DEVICE_RELEASE_NUM       0x010D /* v1.13: Alt 0/1/2 multi-setting test */
 
 /* Alt 0 Single-Setting Streaming Mode (bypasses hardware Alt > 0 autonomous STALL) */
-#define UAC2_SINGLE_ALT0_STREAMING    1
+#define UAC2_SINGLE_ALT0_STREAMING    0
 
 /* Entity IDs (Aligned with TinyUSB UAC2 Speaker layout) */
 #define UAC2_ENTITY_INPUT_TERMINAL    0x01
