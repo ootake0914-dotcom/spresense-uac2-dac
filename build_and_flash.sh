@@ -81,6 +81,14 @@ ensure_config "CONFIG_EXAMPLES_UAC2_DAC_PROGNAME" "\"uac2_dac\""
 ensure_config "CONFIG_EXAMPLES_UAC2_DAC_PRIORITY" "100"
 ensure_config "CONFIG_EXAMPLES_UAC2_DAC_STACKSIZE" "8192"
 
+# 4. Enable Audio Subsystem (CXD5247 /dev/pcm0 for Phase 3 playback)
+enable_config "CONFIG_AUDIO"
+enable_config "CONFIG_AUDIO_CXD56"
+
+# Ensure clean rebuild of app objects
+rm -f "$APP_SRC/.built" "$SDK/apps/libapps.a" "$NUTTX/staging/libapps.a"
+
+
 # Refresh auto-generated Kconfig (picks up uac2_dac/Kconfig via symlink) and
 # resolve dependencies without prompting.
 echo "[CONFIG] Running olddefconfig..."

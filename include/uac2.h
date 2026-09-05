@@ -68,12 +68,31 @@
 #define UAC2_SAMPLE_RATE_44K1         44100u
 
 #define UAC2_CHANNELS                 2u
-#define UAC2_BIT_DEPTH                24u
-#define UAC2_SUBSLOT_SIZE             4u   /* 32-bit container */
 
-/* High-Speed Microframe Calculation (125us = 8000 Hz) */
+/* Format 1: 16-bit PCM (Alt Setting 1) */
+#define UAC2_BIT_DEPTH_16             16u
+#define UAC2_SUBSLOT_SIZE_16          2u   /* 16-bit container */
+
+/* Format 2: 24-bit PCM in 32-bit slot (Alt Setting 2) */
+#define UAC2_BIT_DEPTH_24             24u
+#define UAC2_SUBSLOT_SIZE_24          4u   /* 32-bit container */
+
+/* Legacy aliases */
+#define UAC2_BIT_DEPTH                UAC2_BIT_DEPTH_24
+#define UAC2_SUBSLOT_SIZE             UAC2_SUBSLOT_SIZE_24
+
+/* High-Speed Microframe Calculation (125us = 8000 Hz)
+ * In Asynchronous mode (UAC2 FMT-2.0 2.3.1.1), wMaxPacketSize must include
+ * +1 audio slot (sample) to accommodate host-side clock drift adjustment.
+ * Nominally 192000 / 8000 = 24 samples. Max packet = 24 + 1 = 25 samples.
+ */
 #define UAC2_HS_MICROFRAME_HZ         8000u
-#define UAC2_SAMPLES_PER_UFRAME_192K  (UAC2_SAMPLE_RATE_192K / UAC2_HS_MICROFRAME_HZ) /* 24 */
-#define UAC2_PACKET_SIZE_192K         (UAC2_SAMPLES_PER_UFRAME_192K * UAC2_CHANNELS * UAC2_SUBSLOT_SIZE) /* 192 bytes */
+#define UAC2_NOMINAL_SAMPLES_192K     (UAC2_SAMPLE_RATE_192K / UAC2_HS_MICROFRAME_HZ) /* 24 */
+#define UAC2_MAX_SAMPLES_192K         (UAC2_NOMINAL_SAMPLES_192K + 1u)               /* 25 */
+
+#define UAC2_PACKET_SIZE_16BIT_192K   (UAC2_MAX_SAMPLES_192K * UAC2_CHANNELS * UAC2_SUBSLOT_SIZE_16) /* 100 bytes */
+#define UAC2_PACKET_SIZE_24BIT_192K   (UAC2_MAX_SAMPLES_192K * UAC2_CHANNELS * UAC2_SUBSLOT_SIZE_24) /* 200 bytes */
+#define UAC2_PACKET_SIZE_192K         UAC2_PACKET_SIZE_24BIT_192K
+
 
 #endif /* __UAC2_H */

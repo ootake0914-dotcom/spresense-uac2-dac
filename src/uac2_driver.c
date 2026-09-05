@@ -17,6 +17,7 @@
 
 #include <nuttx/config.h>
 #include <sys/types.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -30,6 +31,8 @@
 #include "uac2.h"
 #include "uac2_desc.h"
 #include "uac2_ringbuf.h"
+#include "uac2_audio_dma.h"
+
 
 /* UAC2 Class Driver State Structure */
 typedef struct
@@ -43,7 +46,8 @@ typedef struct
   struct usbdev_req_s *fbreq;       /* Feedback IN request */
 
   uint8_t config;                   /* Current configuration value */
-  uint8_t alt_setting;              /* AS interface alt: 0 idle, 1 streaming */
+  uint8_t alt_setting;              /* AS interface alt: requested (ISR context) */
+  uint8_t alt_applied;              /* AS interface alt: hardware applied (task context) */
 
   Uac2RingBuffer ringbuf;
   uint32_t sample_rate;             /* Current sample rate (192000) */
@@ -53,6 +57,38 @@ typedef struct
 } Uac2Driver;
 
 static Uac2Driver g_uac2_dev;
+
+/* Lightweight lock-free EP0 SETUP trace queue for zero-overhead debug */
+typedef struct
+{
+  uint8_t  type;
+  uint8_t  req;
+  uint16_t value;
+  uint16_t index;
+  uint16_t len;
+  int16_t  ret;
+} Uac2SetupLog;
+
+#define UAC2_LOG_SIZE 128
+static Uac2SetupLog g_setup_logs[UAC2_LOG_SIZE];
+static volatile uint16_t g_log_head = 0;
+static volatile uint16_t g_log_tail = 0;
+
+static inline void uac2_log_setup(uint8_t type, uint8_t req, uint16_t value,
+                                  uint16_t index, uint16_t len, int16_t ret)
+{
+  uint16_t next = (g_log_head + 1) % UAC2_LOG_SIZE;
+  if (next != g_log_tail)
+    {
+      g_setup_logs[g_log_head].type  = type;
+      g_setup_logs[g_log_head].req   = req;
+      g_setup_logs[g_log_head].value = value;
+      g_setup_logs[g_log_head].index = index;
+      g_setup_logs[g_log_head].len   = len;
+      g_setup_logs[g_log_head].ret   = ret;
+      g_log_head = next;
+    }
+}
 
 /* Forward Declarations */
 static int  uac2_bind(struct usbdevclass_driver_s *drvr,
@@ -88,19 +124,44 @@ static void uac2_ep0_complete(struct usbdev_ep_s *ep,
     }
 }
 
+/* Max ISO OUT packet across Alts (Alt2 24-bit): request buffers use this. */
+#define UAC2_ISO_OUT_MAXPKT UAC2_PACKET_SIZE_24BIT_192K
+
+static uint16_t uac2_alt_packet_size(uint8_t alt)
+{
+#if UAC2_SINGLE_ALT0_STREAMING
+  return UAC2_PACKET_SIZE_24BIT_192K;
+#else
+  /* Alt1 = 16-bit PCM (100B max), Alt2 = 24-bit PCM in 32-bit slot (200B). */
+  return (alt == 1) ? UAC2_PACKET_SIZE_16BIT_192K : UAC2_PACKET_SIZE_24BIT_192K;
+#endif
+}
+
 static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
                                   struct usbdev_req_s *req)
 {
+  static uint32_t s_pkt_count = 0;
+
   /* Audio stream packet received (125us microframe interval) */
   if (req->result == 0 && req->xfrd > 0)
     {
+      s_pkt_count++;
+      if (s_pkt_count <= 5 || (s_pkt_count % 8000 == 0))
+        {
+          printf("[ISO_OUT] pkt #%lu: %u bytes received!\n",
+                 (unsigned long)s_pkt_count, (unsigned)req->xfrd);
+          fflush(stdout);
+        }
       uac2_ringbuf_write(&g_uac2_dev.ringbuf, req->buf, req->xfrd);
+      uac2_audio_write(req->buf, req->xfrd);
     }
 
-  /* Re-queue the request for next packet */
+  /* Re-queue the request for next packet. Buffer is sized for the max
+   * Alt (Alt2 24-bit: 200 B); smaller Alt1 (16-bit) packets fit inside.
+   */
   if (g_uac2_dev.is_streaming && g_uac2_dev.ep_out && req == g_uac2_dev.outreq)
     {
-      req->len = UAC2_PACKET_SIZE_192K;
+      req->len = UAC2_ISO_OUT_MAXPKT;
       EP_SUBMIT(ep, req);
     }
 }
@@ -124,14 +185,20 @@ static void uac2_fb_in_complete(struct usbdev_ep_s *ep,
 
 /* Helpers: endpoint configure descriptors built from static table values */
 
-static void uac2_build_iso_out_desc(FAR struct usb_epdesc_s *epdesc)
+static void uac2_build_iso_out_desc(FAR struct usb_epdesc_s *epdesc, uint8_t alt)
 {
+  uint16_t pktsz = uac2_alt_packet_size(alt);
+
   epdesc->len  = USB_SIZEOF_EPDESC;
   epdesc->type = USB_DESC_TYPE_ENDPOINT;
   epdesc->addr = UAC2_EP_ISO_OUT;
+#if UAC2_SYNC_ADAPTIVE
+  epdesc->attr = 0x09; /* Isochronous, Adaptive */
+#else
   epdesc->attr = 0x05; /* Isochronous, Asynchronous */
-  epdesc->mxpacketsize[0] = (uint8_t)(UAC2_PACKET_SIZE_192K & 0xFF);
-  epdesc->mxpacketsize[1] = (uint8_t)(UAC2_PACKET_SIZE_192K >> 8);
+#endif
+  epdesc->mxpacketsize[0] = (uint8_t)(pktsz & 0xFF);
+  epdesc->mxpacketsize[1] = (uint8_t)(pktsz >> 8);
   epdesc->interval = 0x01;
 }
 
@@ -143,8 +210,10 @@ static void uac2_build_fb_in_desc(FAR struct usb_epdesc_s *epdesc)
   epdesc->attr = 0x11; /* Isochronous, Feedback */
   epdesc->mxpacketsize[0] = 0x04;
   epdesc->mxpacketsize[1] = 0x00;
-  epdesc->interval = 0x04; /* 8 uframes = 1ms */
+  epdesc->interval = 0x01; /* 1 uframe = 125us */
 }
+
+
 
 static void uac2_resetconfig(Uac2Driver *priv)
 {
@@ -190,9 +259,86 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       return -EINVAL;
     }
 
-  /* UAC2 config has no EPs active in Alt-0 (zero-bandwidth).
-   * Nothing to configure here; EPs are configured on SET_INTERFACE Alt-1.
+  /* Configure streaming endpoints at SET_CONFIG time so the controller
+   * hardware arms and initializes them before host sends SET_INTERFACE.
    */
+  if (priv->ep_out)
+    {
+      struct usb_epdesc_s epdesc;
+#if UAC2_SINGLE_ALT0_STREAMING
+      uac2_build_iso_out_desc(&epdesc, 0);
+#else
+      uac2_build_iso_out_desc(&epdesc, 1);
+#endif
+      int ret = EP_CONFIGURE(priv->ep_out, &epdesc, false);
+      if (ret < 0)
+        {
+          printf("[UAC2] Failed to configure EP2 OUT: %d\n", ret);
+        }
+      else
+        {
+          printf("[UAC2] EP2 OUT configured successfully\n");
+        }
+    }
+
+#if !UAC2_SYNC_ADAPTIVE
+  if (priv->ep_fb)
+    {
+      struct usb_epdesc_s epdesc;
+      uac2_build_fb_in_desc(&epdesc);
+      int ret = EP_CONFIGURE(priv->ep_fb, &epdesc, false);
+      if (ret < 0)
+        {
+          printf("[UAC2] Failed to configure EP1 IN: %d\n", ret);
+        }
+      else
+        {
+          printf("[UAC2] EP1 IN configured successfully\n");
+        }
+    }
+#endif
+
+  /* Arm EP2 OUT CSR slot (0x4E20050C = CXD56_USB_DEV_UDC_EP2) explicitly */
+  {
+    volatile uint32_t *usb_busy = (volatile uint32_t *)0x4E200808UL;
+    volatile uint32_t *reg_ep2_csr = (volatile uint32_t *)0x4E20050CUL;
+    volatile uint32_t *reg_devctl = (volatile uint32_t *)0x4E200404UL;
+
+#if UAC2_SINGLE_ALT0_STREAMING
+    uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
+                        (1u << 11) | (0u << 15) | (200u << 19)); /* 0x064008A2 */
+#else
+    uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
+                        (1u << 11) | (1u << 15) | (100u << 19)); /* 0x032088A2 */
+#endif
+
+    while (*usb_busy);
+    *reg_ep2_csr = val_csr;
+    while (*usb_busy);
+
+    /* Latch CSR into hardware with CSR_DONE (do NOT touch CSR_PRG!) */
+    *reg_devctl = *reg_devctl | (1u << 13);
+    while (*usb_busy);
+
+    printf("[UAC2] Pre-armed EP2 CSR (0x50C) <- 0x%08lx\n", (unsigned long)val_csr);
+    fflush(stdout);
+  }
+
+#if UAC2_SINGLE_ALT0_STREAMING
+  /* Immediately arm EP2 OUT for streaming so it is ready for incoming audio */
+  priv->is_streaming = true;
+  priv->alt_setting  = 0;
+  priv->alt_applied  = 0;
+  if (priv->ep_out && priv->outreq)
+    {
+      priv->outreq->len = UAC2_PACKET_SIZE_24BIT_192K;
+      EP_SUBMIT(priv->ep_out, priv->outreq);
+      printf("[UAC2] Pre-submitted EP2 OUT request for Alt 0 streaming (len=%u)\n",
+             (unsigned)priv->outreq->len);
+      fflush(stdout);
+    }
+  uac2_audio_start();
+#endif
 
   priv->config = config;
   return 0;
@@ -200,6 +346,22 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
 
 static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
 {
+  volatile uint32_t *reg_devcfg = (volatile uint32_t *)0x4E200400UL;
+  volatile uint32_t *reg_devctl = (volatile uint32_t *)0x4E200404UL;
+  volatile uint32_t *reg_devsts = (volatile uint32_t *)0x4E200408UL;
+
+  /* EP2 OUT control register: 0x4E200200 + 2*0x20 = 0x4E200240 */
+  volatile uint32_t *reg_ep2_out_ctl = (volatile uint32_t *)0x4E200240UL;
+#if !UAC2_SINGLE_ALT0_STREAMING
+  /* EP1 IN control register:  0x4E200000 + 1*0x20 = 0x4E200020 */
+  volatile uint32_t *reg_ep1_in_ctl  = (volatile uint32_t *)0x4E200020UL;
+#endif
+
+  printf("[UAC2] SET_INTERFACE if=%u alt=%u | CFG=0x%08lx CTL=0x%08lx STS=0x%08lx | EP2CTL=0x%08lx\n",
+         ifno, alt, (unsigned long)*reg_devcfg, (unsigned long)*reg_devctl, (unsigned long)*reg_devsts,
+         (unsigned long)*reg_ep2_out_ctl);
+  fflush(stdout);
+
   if (priv->config != UAC2_CONFIG_ID)
     {
       return -EINVAL;
@@ -216,63 +378,120 @@ static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
       return -EINVAL;
     }
 
-  if (alt > 1)
+#if UAC2_SINGLE_ALT0_STREAMING
+  if (alt != 0)
     {
       return -EINVAL;
     }
 
-  if (alt == priv->alt_setting && ((alt == 1) == priv->is_streaming))
+  /* Alt 0 is the single streaming interface: keep active, clear STALL & NAK */
+  priv->is_streaming = true;
+  priv->alt_setting  = 0;
+
+#define CXD56_HW_USB_STALL (1u << 0)
+#define CXD56_HW_USB_CNAK  (1u << 8)
+
+  *reg_ep2_out_ctl = (*reg_ep2_out_ctl & ~CXD56_HW_USB_STALL) | CXD56_HW_USB_CNAK;
+
+  return 0;
+#else
+  if (alt > 2)
+    {
+      return -EINVAL;
+    }
+
+  if (alt == priv->alt_setting && ((alt > 0) == priv->is_streaming))
     {
       return 0;
     }
 
   if (alt == 0)
     {
-      /* Stop streaming */
+      /* Stop streaming request (ISR context: flags + SNAK only, NO STALL!).
+       * Note: NuttX EP_DISABLE() calls cxd56_epstall(false) which sets USB_STALL,
+       * causing hardware to STALL subsequent SET_INTERFACE(alt>0).
+       * Follow Linux pch_udc_ep_disable: set SNAK and clear STALL!
+       */
       priv->is_streaming = false;
       priv->alt_setting  = 0;
-      if (priv->ep_out)
-        {
-          EP_DISABLE(priv->ep_out);
-        }
 
-      if (priv->ep_fb)
-        {
-          EP_DISABLE(priv->ep_fb);
-        }
+#define CXD56_HW_USB_STALL (1u << 0)
+#define CXD56_HW_USB_SNAK  (1u << 7)
+
+      *reg_ep2_out_ctl = (*reg_ep2_out_ctl & ~CXD56_HW_USB_STALL) | CXD56_HW_USB_SNAK;
+      *reg_ep1_in_ctl  = (*reg_ep1_in_ctl  & ~CXD56_HW_USB_STALL) | CXD56_HW_USB_SNAK;
 
       return 0;
     }
 
-  /* Alt-1: start streaming. Configure EPs when the DCD provides them.
-   * If ISOC EPs are unavailable (pre-Phase-2 DCD), still ACK so that
-   * enumeration / alt-probe completes; streaming actually starts once
-   * the DCD ISOC patch lands.
+  /* Alt-1 (16-bit PCM) / Alt-2 (24-bit PCM in 32-bit slot): record request.
+   * Hardware bring-up (EP_CONFIGURE/SUBMIT, audio_start, logging) runs
+   * deferred in uac2_driver_poll() task context: EP0 setup executes in USB
+   * interrupt context where printf/malloc/ISOC bring-up hung the MCU.
    */
-
-  priv->alt_setting  = 1;
+  priv->alt_setting  = alt;
   priv->is_streaming = true;
+
+  return 0;
+#endif
+}
+
+/**
+ * @brief Apply pending Alt changes in task context (call every ~100ms).
+ *
+ * Performs the deferred streaming hardware bring-up with stepwise logging
+ * so a hang localizes precisely (last printed step == killer).
+ */
+void uac2_driver_poll(void)
+{
+  Uac2Driver *priv = &g_uac2_dev;
+  uint8_t alt;
+
+  if (!priv->dev || priv->alt_setting == priv->alt_applied)
+    {
+      return;
+    }
+
+  alt = priv->alt_setting;
+  printf("[UAC2] applying alt %u (was %u)\n", (unsigned)alt,
+         (unsigned)priv->alt_applied);
+  fflush(stdout);
+
+  if (alt == 0)
+    {
+      uac2_audio_stop();
+      priv->alt_applied = 0;
+      return;
+    }
 
   if (priv->ep_out)
     {
       struct usb_epdesc_s epdesc;
-      uac2_build_iso_out_desc(&epdesc);
+      uac2_build_iso_out_desc(&epdesc, alt);
+      printf("[UAC2] ep_out configure (alt %u, pkt %u)\n",
+             (unsigned)alt, (unsigned)uac2_alt_packet_size(alt));
+      fflush(stdout);
       EP_CONFIGURE(priv->ep_out, &epdesc, false);
-
-      if (!priv->outreq)
-        {
-          priv->outreq = usbdev_allocreq(priv->ep_out, UAC2_PACKET_SIZE_192K);
-          if (priv->outreq)
-            {
-              priv->outreq->callback = uac2_iso_out_complete;
-            }
-        }
+      printf("[UAC2] ep_out configured\n");
+      fflush(stdout);
 
       if (priv->outreq)
         {
-          priv->outreq->len = UAC2_PACKET_SIZE_192K;
+          priv->outreq->len = uac2_alt_packet_size(alt);
           EP_SUBMIT(priv->ep_out, priv->outreq);
+          printf("[UAC2] ep_out streaming armed\n");
+          fflush(stdout);
         }
+      else
+        {
+          printf("[UAC2] ep_out: no request (bind alloc failed), ACK-only\n");
+          fflush(stdout);
+        }
+    }
+  else
+    {
+      printf("[UAC2] ep_out unavailable, ACK-only streaming\n");
+      fflush(stdout);
     }
 
   if (priv->ep_fb)
@@ -281,21 +500,6 @@ static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
       uac2_build_fb_in_desc(&epdesc);
       EP_CONFIGURE(priv->ep_fb, &epdesc, true);
 
-      if (!priv->fbreq)
-        {
-          priv->fbreq = usbdev_allocreq(priv->ep_fb, 4);
-          if (priv->fbreq)
-            {
-              priv->fbreq->callback = uac2_fb_in_complete;
-              /* Nominal feedback payload (Phase 4 will update): 192kHz */
-              priv->fbreq->buf[0] = 0x00;
-              priv->fbreq->buf[1] = 0x00;
-              priv->fbreq->buf[2] = 0x06;
-              priv->fbreq->buf[3] = 0x00;
-              priv->fbreq->len    = 4;
-            }
-        }
-
       if (priv->fbreq)
         {
           priv->fbreq->len = 4;
@@ -303,7 +507,8 @@ static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
         }
     }
 
-  return 0;
+  uac2_audio_start();
+  priv->alt_applied = alt;
 }
 
 static int uac2_bind(struct usbdevclass_driver_s *drvr,
@@ -354,11 +559,46 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
   priv->config       = 0;
   priv->sample_rate  = UAC2_SAMPLE_RATE_192K;
   priv->alt_setting  = 0;
+  priv->alt_applied  = 0;
   priv->is_streaming = false;
   memset(priv->mute, 0, sizeof(priv->mute));
   memset(priv->volume, 0, sizeof(priv->volume));
   priv->outreq = NULL;
   priv->fbreq  = NULL;
+
+  /* Pre-allocate streaming requests here (task context): allocreq must
+   * never run in EP0 setup (USB interrupt) context.
+   */
+  if (priv->ep_out)
+    {
+      priv->outreq = usbdev_allocreq(priv->ep_out, UAC2_ISO_OUT_MAXPKT);
+      if (priv->outreq)
+        {
+          priv->outreq->callback = uac2_iso_out_complete;
+        }
+    }
+
+  if (priv->ep_fb)
+    {
+      priv->fbreq = usbdev_allocreq(priv->ep_fb, 4);
+      if (priv->fbreq)
+        {
+          priv->fbreq->callback = uac2_fb_in_complete;
+          /* Nominal feedback payload for 192kHz HS: Fs/8000 = 24.0
+           * in 16.16 fixed point (0x00180000 LE).
+           */
+          priv->fbreq->buf[0] = 0x00;
+          priv->fbreq->buf[1] = 0x00;
+          priv->fbreq->buf[2] = 0x18;
+          priv->fbreq->buf[3] = 0x00;
+          priv->fbreq->len    = 4;
+        }
+    }
+
+  printf("[UAC2] bind EPs: out=%p outreq=%p fb=%p fbreq=%p\n",
+         (void *)priv->ep_out, (void *)priv->outreq,
+         (void *)priv->ep_fb, (void *)priv->fbreq);
+  fflush(stdout);
 
 #ifdef CONFIG_USBDEV_SELFPOWERED
   DEV_SETSELFPOWERED(dev);
@@ -429,19 +669,20 @@ static int uac2_clock_source_request(Uac2Driver *priv,
             }
           else
             {
-              /* SET_CUR frequency: accept 192k (or store if multi-rate later) */
+              /* SET_CUR frequency: accept requested sample rates */
               if (dataout && outlen >= 4)
                 {
                   uint32_t newfreq;
                   memcpy(&newfreq, dataout, 4);
-                  if (newfreq == UAC2_SAMPLE_RATE_192K)
+                  if (newfreq == 44100 || newfreq == 48000 ||
+                      newfreq == 88200 || newfreq == 96000 ||
+                      newfreq == 176400 || newfreq == 192000)
                     {
                       priv->sample_rate = newfreq;
                     }
                   else
                     {
-                      /* Phase 1 is 192k-only; ACK anyway to keep host happy */
-                      uinfo("SET_CUR freq %lu ignored (192k-only)\n",
+                      uinfo("SET_CUR freq %lu ignored (unsupported)\n",
                             (unsigned long)newfreq);
                     }
                 }
@@ -451,13 +692,49 @@ static int uac2_clock_source_request(Uac2Driver *priv,
         }
       else if (req == UAC2_CS_RANGE)
         {
-          /* One subrange: 192000..192000, res 0 */
+          /* 6 discrete sample rate subranges for Windows usbaudio2.sys
+           * DataRangeIntersection compatibility.
+           * Windows disables the KS pin (no "Advanced" tab) with
+           * STATUS_RANGE_NOT_FOUND (0xC000028C) if 44.1k/48k is absent
+           * from RANGE, even when the device's native rate is 192kHz.
+           * Each discrete rate: dMIN == dMAX == freq, dRES == 0
+           * (per MS docs "USB Audio 2.0 Drivers / Clock source entity"
+           * and UAC2 spec ADC-2 Table 5-1 / Sec 5.2.1).
+           * Must not overlap; order ascending.
+           */
           static const uint8_t range_desc[] =
           {
-            0x01, 0x00,               /* wNumSubRanges: 1 */
+            0x06, 0x00,               /* wNumSubRanges: 6 */
+
+            /* Subrange 1: 44100 Hz (0x0000AC44) */
+            0x44, 0xAC, 0x00, 0x00,   /* dMIN: 44100 */
+            0x44, 0xAC, 0x00, 0x00,   /* dMAX: 44100 */
+            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
+
+            /* Subrange 2: 48000 Hz (0x0000BB80) */
+            0x80, 0xBB, 0x00, 0x00,   /* dMIN: 48000 */
+            0x80, 0xBB, 0x00, 0x00,   /* dMAX: 48000 */
+            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
+
+            /* Subrange 3: 88200 Hz (0x00015888) */
+            0x88, 0x58, 0x01, 0x00,   /* dMIN: 88200 */
+            0x88, 0x58, 0x01, 0x00,   /* dMAX: 88200 */
+            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
+
+            /* Subrange 4: 96000 Hz (0x00017700) */
+            0x00, 0x77, 0x01, 0x00,   /* dMIN: 96000 */
+            0x00, 0x77, 0x01, 0x00,   /* dMAX: 96000 */
+            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
+
+            /* Subrange 5: 176400 Hz (0x0002B110) */
+            0x10, 0xB1, 0x02, 0x00,   /* dMIN: 176400 */
+            0x10, 0xB1, 0x02, 0x00,   /* dMAX: 176400 */
+            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
+
+            /* Subrange 6: 192000 Hz (0x0002EE00, native) */
             0x00, 0xEE, 0x02, 0x00,   /* dMIN: 192000 */
             0x00, 0xEE, 0x02, 0x00,   /* dMAX: 192000 */
-            0x00, 0x00, 0x00, 0x00    /* dRES: 0 */
+            0x00, 0x00, 0x00, 0x00    /* dRES: 0 (discrete) */
           };
 
           memcpy(ctrlreq->buf, range_desc, sizeof(range_desc));
@@ -501,7 +778,10 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
             {
               if (dataout && outlen >= 1)
                 {
-                  priv->mute[idx] = (dataout[0] != 0);
+                  priv->mute[0] = (dataout[0] != 0);
+                  priv->mute[1] = priv->mute[0];
+                  priv->mute[2] = priv->mute[0];
+                  uac2_audio_set_mute(priv->mute[0]);
                 }
 
               return 0;
@@ -521,7 +801,28 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
             {
               if (dataout && outlen >= 2)
                 {
-                  memcpy(&priv->volume[idx], dataout, 2);
+                  int16_t raw_vol;
+                  uint8_t percent;
+
+                  memcpy(&priv->volume[0], dataout, 2);
+                  priv->volume[1] = priv->volume[0];
+                  priv->volume[2] = priv->volume[0];
+
+                  raw_vol = (int16_t)priv->volume[0];
+                  if (raw_vol <= -24576) /* -96dB */
+                    {
+                      percent = 0;
+                    }
+                  else if (raw_vol >= 0) /* 0dB */
+                    {
+                      percent = 100;
+                    }
+                  else
+                    {
+                      percent = (uint8_t)(((int32_t)(raw_vol + 24576) * 100) / 24576);
+                    }
+
+                  uac2_audio_set_volume(percent);
                 }
 
               return 0;
@@ -529,42 +830,22 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
         }
       else if (req == UAC2_CS_RANGE)
         {
-          /* One subrange: MIN -60dB (0xC400), MAX 0dB, RES 1dB (0x0100) */
+          /* One subrange: MIN -96dB (0xA000), MAX 0dB, RES 1dB (0x0100) */
           static const uint8_t vol_range[] =
           {
             0x01, 0x00,   /* wNumSubRanges: 1 */
-            0x00, 0xC4,   /* MIN Lo (-60dB LE: 0xC400) */
+            0x00, 0xA0,   /* MIN Lo (-96dB LE: 0xA000) */
             0x00, 0x00,   /* MAX Lo (0dB) */
             0x00, 0x01    /* RES Lo (1dB) */
           };
-          /* NOTE: minimal 8-byte form (wNumSubRanges + MIN/MAX/RES words)
-           * accepted by Windows/macOS for volume. Full UAC2 RANGE uses
-           * 4-byte d-words, but 2-byte form is what hosts probe here.
-           */
+
           memcpy(ctrlreq->buf, vol_range, sizeof(vol_range));
           return sizeof(vol_range);
-        }
-      else if (req == 0x03) /* MIN */
-        {
-          ctrlreq->buf[0] = 0x00;
-          ctrlreq->buf[1] = 0xC4;
-          return 2;
-        }
-      else if (req == 0x04) /* MAX */
-        {
-          ctrlreq->buf[0] = 0x00;
-          ctrlreq->buf[1] = 0x00;
-          return 2;
-        }
-      else if (req == 0x05) /* RES */
-        {
-          ctrlreq->buf[0] = 0x00;
-          ctrlreq->buf[1] = 0x01;
-          return 2;
         }
     }
 
   return -EOPNOTSUPP;
+
 }
 
 static int uac2_setup(struct usbdevclass_driver_s *drvr,
@@ -643,6 +924,13 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
         case USB_REQ_SETCONFIGURATION:
           if (type == 0)
             {
+              /* Log negotiated USB speed: 2=FULL (12Mbps, 192k impossible),
+               * 3=HIGH (480Mbps, required for 192k/24bit). */
+              printf("[UAC2] SET_CONFIG %u, USB speed=%u (%s)\n",
+                     (unsigned)value, (unsigned)dev->speed,
+                     (dev->speed == 3) ? "HIGH-480M" :
+                     (dev->speed == 2) ? "FULL-12M" : "OTHER");
+              fflush(stdout);
               ret = uac2_setconfig(priv, (uint8_t)value);
               if (ret == 0)
                 {
@@ -664,7 +952,20 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
         case USB_REQ_SETINTERFACE:
           if ((type & USB_REQ_RECIPIENT_MASK) == USB_REQ_RECIPIENT_INTERFACE)
             {
+              /* Rev19 diag: log every SET_IF arrival. The CXD56 DCD calls
+               * CLASS_SETUP twice per SET_IF: once from EP0 SETUP (real
+               * packet values, dataout != NULL) and once from the USB_INT_SI
+               * ISR with HW-synthesized values from USB_DEV_STATUS
+               * (dataout == NULL). A synthesized alt > 2 returns -EINVAL
+               * and STALLs EP0 after the real path already ACKed.
+               */
+              printf("[UAC2] SET_IF if=%u alt=%u via=%s\n",
+                     (unsigned)index, (unsigned)value,
+                     dataout ? "ep0" : "SI-synth");
+              fflush(stdout);
               ret = uac2_setinterface(priv, (uint8_t)index, (uint8_t)value);
+              printf("[UAC2] SET_IF -> %d\n", ret);
+              fflush(stdout);
             }
           break;
 
@@ -705,6 +1006,54 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
           ret = uac2_feature_unit_request(priv, ctrl, dataout, outlen,
                                           cs, ch, req);
         }
+      else if (entity_id == 0)
+        {
+          /* Interface-level requests (Entity ID 0) */
+          uint8_t ifno = (uint8_t)(index & 0xFF);
+          if (ifno == UAC2_IF_AUDIO_CONTROL)
+            {
+              /* Latency Control (CS=0x01) or general AC requests */
+              if (req == UAC2_CS_CUR && (type & USB_REQ_DIR_IN))
+                {
+                  ctrlreq->buf[0] = 0x00;
+                  ret = 1;
+                }
+              else if (req == UAC2_CS_CUR)
+                {
+                  ret = 0;
+                }
+            }
+          else if (ifno == UAC2_IF_AUDIO_STREAMING)
+            {
+              if (cs == 0x01) /* AS_ACT_ALT_SETTING_CONTROL */
+                {
+                  if (req == UAC2_CS_CUR && (type & USB_REQ_DIR_IN))
+                    {
+                      ctrlreq->buf[0] = priv->alt_setting;
+                      ret = 1;
+                    }
+                  else if (req == UAC2_CS_CUR)
+                    {
+                      ret = 0;
+                    }
+                }
+              else if (cs == 0x02) /* AS_VAL_ALT_SETTINGS_CONTROL */
+                {
+                  if (req == UAC2_CS_CUR && (type & USB_REQ_DIR_IN))
+                    {
+#if UAC2_SINGLE_ALT0_STREAMING
+                      /* Only Alt 0 is valid: bit 0 = 0x01 */
+                      ctrlreq->buf[0] = 0x01;
+#else
+                      /* Alt 0 (zero bandwidth), Alt 1 (16-bit PCM) and
+                       * Alt 2 (24-bit PCM) are valid: bits 0, 1, 2 = 0x07 */
+                      ctrlreq->buf[0] = 0x07;
+#endif
+                      ret = 1;
+                    }
+                }
+            }
+        }
       else if (entity_id == UAC2_ENTITY_INPUT_TERMINAL ||
                entity_id == UAC2_ENTITY_OUTPUT_TERMINAL)
         {
@@ -723,6 +1072,9 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
             }
         }
     }
+
+  /* Record to lock-free setup trace log */
+  uac2_log_setup(type, req, value, index, len, (int16_t)ret);
 
   /* Respond to the setup command if data was returned. On error
    * (ret < 0) the DCD will stall.
@@ -782,3 +1134,21 @@ void uac2_get_status(bool *is_streaming, uint8_t *alt_setting, uint32_t *sample_
   if (overrun) *overrun = g_uac2_dev.ringbuf.overrun_count;
   if (buffered) *buffered = uac2_ringbuf_available_read(&g_uac2_dev.ringbuf);
 }
+
+void uac2_dump_setup_logs(void)
+{
+  while (g_log_tail != g_log_head)
+    {
+      Uac2SetupLog log = g_setup_logs[g_log_tail];
+      g_log_tail = (g_log_tail + 1) % UAC2_LOG_SIZE;
+
+      uint8_t entity = (uint8_t)(log.index >> 8);
+      uint8_t ifno   = (uint8_t)(log.index & 0xFF);
+      uint8_t cs     = (uint8_t)(log.value >> 8);
+      uint8_t ch     = (uint8_t)(log.value & 0xFF);
+
+      printf("[EP0] type=0x%02x req=0x%02x val=0x%04x(cs=%u,ch=%u) idx=0x%04x(ent=%u,if=%u) len=%u -> ret=%d\n",
+             log.type, log.req, log.value, cs, ch, log.index, entity, ifno, log.len, log.ret);
+    }
+}
+

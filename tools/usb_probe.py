@@ -4,15 +4,15 @@ USB Audio Device Probe Tool for Spresense UAC2 DAC (Phase 1: Enumeration)
 Verifies USB enumeration, descriptors, and audio device registration.
 
 Expected device:
-  VID:PID = 054C:0CE6
+  VID = 054C (Sony), PID = 0CEC (current; Rev 7: PID 0x0CEC, Adaptive Mode)
   Strings: Sony / Spresense 192kHz/24bit Audio
-  Config : 192kHz, 2ch, 24-bit (32-bit slot), 192 bytes/uframe
+  Config : 192kHz, 2ch, 24-bit (32-bit slot), 200 bytes/uframe
 """
 import sys
 import platform
 import subprocess
 
-VID_PID = ("054c", "0ce6")
+VID = "054c"
 EXPECT_SR = 192000
 
 
@@ -50,8 +50,8 @@ def probe_windows():
 
 def probe_linux():
     ok = False
-    print("[PROBE] Linux USB Audio check (VID:PID 054c:0ce6)...")
-    for cmd in (["lsusb"], ["lsusb", "-v", "-d", "054c:0ce6"], ["aplay", "-l"]):
+    print("[PROBE] Linux USB Audio check (VID 054c, any PID)...")
+    for cmd in (["lsusb"], ["lsusb", "-v", "-d", "054c:"], ["aplay", "-l"]):
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             print(f"\n$ {' '.join(cmd)}")
@@ -76,7 +76,7 @@ def main():
     print("==================================================")
     print(" Spresense UAC2 Hi-Res DAC Probe Tool (Phase 1)")
     print(f" Platform: {platform.system()} {platform.release()}")
-    print(f" Expect: VID:PID {VID_PID[0]}:{VID_PID[1]}, {EXPECT_SR} Hz, 2ch, 24-bit")
+    print(f" Expect: VID {VID} (PID 0CEA current), {EXPECT_SR} Hz, 2ch, 24-bit")
     print("==================================================")
     plat = platform.system()
     if plat == "Windows":

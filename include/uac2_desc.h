@@ -12,14 +12,17 @@
 #include "uac2.h"
 
 #define UAC2_VENDOR_ID                0x054C /* Sony Corporation */
-#define UAC2_PRODUCT_ID               0x0CE6 /* Spresense UAC2 Hi-Res DAC */
-#define UAC2_DEVICE_RELEASE_NUM       0x0100 /* v1.00 */
+#define UAC2_PRODUCT_ID               0x0CED /* Spresense UAC2 Hi-Res DAC (Rev 20: UDC alt2 arm) */
+#define UAC2_DEVICE_RELEASE_NUM       0x010C /* v1.12: Alt 0 single-setting streaming (hardware stall bypass) */
 
-/* Entity IDs */
-#define UAC2_ENTITY_CLOCK_SOURCE      0x01
-#define UAC2_ENTITY_INPUT_TERMINAL    0x02
-#define UAC2_ENTITY_FEATURE_UNIT      0x03
-#define UAC2_ENTITY_OUTPUT_TERMINAL   0x04
+/* Alt 0 Single-Setting Streaming Mode (bypasses hardware Alt > 0 autonomous STALL) */
+#define UAC2_SINGLE_ALT0_STREAMING    1
+
+/* Entity IDs (Aligned with TinyUSB UAC2 Speaker layout) */
+#define UAC2_ENTITY_INPUT_TERMINAL    0x01
+#define UAC2_ENTITY_FEATURE_UNIT      0x02
+#define UAC2_ENTITY_OUTPUT_TERMINAL   0x03
+#define UAC2_ENTITY_CLOCK_SOURCE      0x04
 
 /* Interface Numbers */
 #define UAC2_IF_AUDIO_CONTROL         0x00
@@ -30,6 +33,36 @@
 #define UAC2_CONFIG_ID                0x01
 #define UAC2_CONFIG_NCONFIGS          0x01
 #define UAC2_MXDESCLEN                256
+
+/* Sync type diagnostic toggle (flip to 1 + rebuild + reflash for the test).
+ *   0 = Asynchronous OUT + Feedback IN (product goal, Phase 4).
+ *   1 = Adaptive OUT, no Feedback EP (diagnostic: removes the entire
+ *       feedback subsystem from enumeration to isolate pin-creation
+ *       failures. Host paces packets; ring buffer absorbs drift.
+ *       No headphone sound yet either way - CXD5247 DMA is still a stub;
+ *       judge by Initialize S_OK + NSH STREAMING/Buf growth, NOT by sound).
+ */
+#define UAC2_SYNC_ADAPTIVE            1
+
+/* Rev18 DIAGNOSTIC toggle (revert to 0 after the 2x2 result).
+ *   1 = Alt1 is zero-bandwidth (bNumEndpoints=0, no EP descs): tests whether
+ *       the SET_INTERFACE stall is gated by EP presence (EP-gating) or by the
+ *       Alt value itself (value-gating). Alt2 keeps its 24-bit EP.
+ *       Expect: Alt1 ACK + Alt2 STALL => EP-gating (UDC programming fix).
+ *               Alt1 STALL + Alt2 STALL => value-gating (SI/DCD fix).
+ *       RESULT: Alt1 STALLed with zero EPs => value-gating CONFIRMED.
+ *       Reverted to 0 (product descriptors restored).
+ */
+#define UAC2_DIAG_ALT1_ZEROBW         0
+
+
+/* wMaxPacketSize diagnostic toggle (flip to 1 + rebuild + reflash).
+ *   0 = 200B headroom (UAC2_MAX_SAMPLES=25, async tolerance design).
+ *   1 = exact nominal 192B (24 samples x 2ch x 4B, zero headroom).
+ * Tests whether usbaudio2.sys pin creation strictly validates
+ * wMaxPacketSize against the nominal packet size.
+ */
+#define UAC2_WMAX_NOMINAL             0
 
 /* Endpoint Addresses
  * NOTE (CXD5602 constraint): cxd56_usbdev.c allocates endpoints by
