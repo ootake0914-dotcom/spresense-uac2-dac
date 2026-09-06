@@ -10,7 +10,9 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define UAC2_RINGBUF_CAPACITY (64 * 1024) /* 64KB: ~85ms buffer at 192kHz/24bit */
+#define UAC2_RINGBUF_CAPACITY (128 * 1024) /* 128KB: ~85ms @192k/stereo/32-bit.
+ * 1.5MB RAM制約のため256KBは不可。死にringbuf削除と等価交換で差分ゼロ。
+ * 壁2倍＋レベルサーボで無限化するので十分。 */
 
 typedef struct {
     uint8_t buffer[UAC2_RINGBUF_CAPACITY];

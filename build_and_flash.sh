@@ -2,14 +2,15 @@
 set -e
 
 echo "=== Building Spresense UAC2 192kHz/24bit DAC (Phase 1: Enumeration) ==="
-export PATH="/home/ootak/spresense-tools/gcc-arm-none-eabi-9-2020-q2-update/bin:/usr/bin:/bin"
+TOOLS_ROOT="${SPRESENSE_TOOLS:-$HOME/spresense-tools}"
+export PATH="$TOOLS_ROOT/gcc-arm-none-eabi-9-2020-q2-update/bin:/usr/bin:/bin"
 
-SPRESENSE=/home/ootak/spresense
+SPRESENSE="${SPRESENSE:-$HOME/spresense}"
 SDK=$SPRESENSE/sdk
 NUTTX=$SPRESENSE/nuttx
 DOTCONFIG=$NUTTX/.config
 APP_LINK=$SDK/apps/examples/uac2_dac
-APP_SRC=/home/ootak/spresense_uac2_dac
+APP_SRC="$(cd "$(dirname "$0")" && pwd)"
 
 # 1. Ensure symlink apps/examples/uac2_dac -> spresense_uac2_dac
 if [ ! -e "$APP_LINK" ]; then
@@ -103,6 +104,10 @@ if [ ! -f nuttx.spk ]; then
     echo "[ERROR] nuttx.spk not found after build."
     exit 1
 fi
+
+# Remove path-mangled object files (e.g. uac2_desc.c.home.user.proj.o) that
+# the NuttX apps build drops into src/ — filenames embed the absolute path.
+rm -f "$APP_SRC"/src/*.o
 
 # 4. Flash (WSL: pass Windows COM port through; Linux: /dev/ttyUSB0)
 PORT="${1:-COM6}"

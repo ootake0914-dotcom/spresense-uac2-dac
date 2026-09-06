@@ -49,7 +49,7 @@ typedef struct
   uint8_t alt_setting;              /* AS interface alt: requested (ISR context) */
   uint8_t alt_applied;              /* AS interface alt: hardware applied (task context) */
 
-  Uac2RingBuffer ringbuf;
+  /* 死にringbuf撤去済み（実給電はuac2_audio_dma.c側g_pcm_ringのみ） */
   uint32_t sample_rate;             /* Current sample rate (192000) */
   bool mute[3];                     /* Master, Ch1, Ch2 */
   int16_t volume[3];                /* 8.8 fixed-point dB, 0 = 0dB */
@@ -146,13 +146,16 @@ static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
   if (req->result == 0 && req->xfrd > 0)
     {
       s_pkt_count++;
+#if !UAC2_SILENT_DIAG
       if (s_pkt_count <= 5 || (s_pkt_count % 8000 == 0))
         {
-          printf("[ISO_OUT] pkt #%lu: %u bytes received!\n",
+          UAC2_TPRINTF("[ISO_OUT] pkt #%lu: %u bytes received!\n",
                  (unsigned long)s_pkt_count, (unsigned)req->xfrd);
-          fflush(stdout);
         }
-      uac2_ringbuf_write(&g_uac2_dev.ringbuf, req->buf, req->xfrd);
+#endif
+      /* 給電はg_pcm_ring（uac2_audio_dma.c側）のみ。二重書き込み排除
+       * （Claude指摘：g_uac2_dev.ringbufは誰にもreadされず統計が腐る）。
+       */
       uac2_audio_write(req->buf, req->xfrd);
     }
 
@@ -273,11 +276,11 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       int ret = EP_CONFIGURE(priv->ep_out, &epdesc, false);
       if (ret < 0)
         {
-          printf("[UAC2] Failed to configure EP2 OUT: %d\n", ret);
+          UAC2_TPRINTF("[UAC2] Failed to configure EP2 OUT: %d\n", ret);
         }
       else
         {
-          printf("[UAC2] EP2 OUT configured successfully\n");
+          UAC2_TPRINTF("[UAC2] EP2 OUT configured successfully\n");
         }
     }
 
@@ -289,11 +292,11 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       int ret = EP_CONFIGURE(priv->ep_fb, &epdesc, false);
       if (ret < 0)
         {
-          printf("[UAC2] Failed to configure EP1 IN: %d\n", ret);
+          UAC2_TPRINTF("[UAC2] Failed to configure EP1 IN: %d\n", ret);
         }
       else
         {
-          printf("[UAC2] EP1 IN configured successfully\n");
+          UAC2_TPRINTF("[UAC2] EP1 IN configured successfully\n");
         }
     }
 #endif
@@ -320,8 +323,7 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
     *reg_devctl = *reg_devctl | (1u << 13);
     while (*usb_busy);
 
-    printf("[UAC2] Pre-armed EP2 CSR (0x50C) <- 0x%08lx\n", (unsigned long)val_csr);
-    fflush(stdout);
+    UAC2_TPRINTF("[UAC2] Pre-armed EP2 CSR (0x50C) <- 0x%08lx\n", (unsigned long)val_csr);
   }
 
 #if UAC2_SINGLE_ALT0_STREAMING
@@ -333,9 +335,8 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
     {
       priv->outreq->len = UAC2_PACKET_SIZE_24BIT_192K;
       EP_SUBMIT(priv->ep_out, priv->outreq);
-      printf("[UAC2] Pre-submitted EP2 OUT request for Alt 0 streaming (len=%u)\n",
+      UAC2_TPRINTF("[UAC2] Pre-submitted EP2 OUT request for Alt 0 streaming (len=%u)\n",
              (unsigned)priv->outreq->len);
-      fflush(stdout);
     }
   uac2_audio_start();
 #endif
@@ -357,10 +358,9 @@ static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
   volatile uint32_t *reg_ep1_in_ctl  = (volatile uint32_t *)0x4E200020UL;
 #endif
 
-  printf("[UAC2] SET_INTERFACE if=%u alt=%u | CFG=0x%08lx CTL=0x%08lx STS=0x%08lx | EP2CTL=0x%08lx\n",
+  UAC2_TPRINTF("[UAC2] SET_INTERFACE if=%u alt=%u | CFG=0x%08lx CTL=0x%08lx STS=0x%08lx | EP2CTL=0x%08lx\n",
          ifno, alt, (unsigned long)*reg_devcfg, (unsigned long)*reg_devctl, (unsigned long)*reg_devsts,
          (unsigned long)*reg_ep2_out_ctl);
-  fflush(stdout);
 
   if (priv->config != UAC2_CONFIG_ID)
     {
@@ -555,7 +555,6 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
     }
 
   /* Initialize audio state */
-  uac2_ringbuf_init(&priv->ringbuf);
   priv->config       = 0;
   priv->sample_rate  = UAC2_SAMPLE_RATE_192K;
   priv->alt_setting  = 0;
@@ -595,10 +594,9 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
         }
     }
 
-  printf("[UAC2] bind EPs: out=%p outreq=%p fb=%p fbreq=%p\n",
+  UAC2_TPRINTF("[UAC2] bind EPs: out=%p outreq=%p fb=%p fbreq=%p\n",
          (void *)priv->ep_out, (void *)priv->outreq,
          (void *)priv->ep_fb, (void *)priv->fbreq);
-  fflush(stdout);
 
 #ifdef CONFIG_USBDEV_SELFPOWERED
   DEV_SETSELFPOWERED(dev);
@@ -669,22 +667,25 @@ static int uac2_clock_source_request(Uac2Driver *priv,
             }
           else
             {
-              /* SET_CUR frequency: accept requested sample rates */
+              /* TEMP-DIAG Rev54: 非対応値もSTALLせず192kクランプACK。
+               * SET_CUR拒否STALL後のEP0リカバリ不全による焼き付き疑いの
+               * 切り分け。エンジンは192k固定のため実害なし（のはず）。
+               * RANGEは192k-only維持。
+               */
               if (dataout && outlen >= 4)
                 {
                   uint32_t newfreq;
                   memcpy(&newfreq, dataout, 4);
-                  if (newfreq == 44100 || newfreq == 48000 ||
-                      newfreq == 88200 || newfreq == 96000 ||
-                      newfreq == 176400 || newfreq == 192000)
+                  if (newfreq == 192000)
                     {
                       priv->sample_rate = newfreq;
                     }
-                  else
-                    {
-                      uinfo("SET_CUR freq %lu ignored (unsupported)\n",
-                            (unsigned long)newfreq);
-                    }
+                    else
+                      {
+                        UAC2_TPRINTF("[UAC2] SET_CUR freq %lu clamped to 192000 (no STALL)\n",
+                               (unsigned long)newfreq);
+                        priv->sample_rate = 192000;
+                      }
                 }
 
               return 0;
@@ -692,46 +693,19 @@ static int uac2_clock_source_request(Uac2Driver *priv,
         }
       else if (req == UAC2_CS_RANGE)
         {
-          /* 6 discrete sample rate subranges for Windows usbaudio2.sys
-           * DataRangeIntersection compatibility.
-           * Windows disables the KS pin (no "Advanced" tab) with
-           * STATUS_RANGE_NOT_FOUND (0xC000028C) if 44.1k/48k is absent
-           * from RANGE, even when the device's native rate is 192kHz.
-           * Each discrete rate: dMIN == dMAX == freq, dRES == 0
-           * (per MS docs "USB Audio 2.0 Drivers / Clock source entity"
-           * and UAC2 spec ADC-2 Table 5-1 / Sec 5.2.1).
-           * Must not overlap; order ascending.
+          /* Single discrete subrange: 192kHz native only.
+           * (Former 6-rate table was for Windows usbaudio2 compat;
+           * Windows path abandoned (CXD5602 Alt>0 HW stall), Linux-only now.
+           * Advertising other rates lets hosts (e.g. PipeWire 48k) open
+           * the device at a rate the fixed engine cannot serve.)
+           * One discrete rate: dMIN == dMAX == freq, dRES == 0
+           * (UAC2 spec ADC-2 Table 5-1 / Sec 5.2.1).
            */
           static const uint8_t range_desc[] =
           {
-            0x06, 0x00,               /* wNumSubRanges: 6 */
+            0x01, 0x00,               /* wNumSubRanges: 1 */
 
-            /* Subrange 1: 44100 Hz (0x0000AC44) */
-            0x44, 0xAC, 0x00, 0x00,   /* dMIN: 44100 */
-            0x44, 0xAC, 0x00, 0x00,   /* dMAX: 44100 */
-            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
-
-            /* Subrange 2: 48000 Hz (0x0000BB80) */
-            0x80, 0xBB, 0x00, 0x00,   /* dMIN: 48000 */
-            0x80, 0xBB, 0x00, 0x00,   /* dMAX: 48000 */
-            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
-
-            /* Subrange 3: 88200 Hz (0x00015888) */
-            0x88, 0x58, 0x01, 0x00,   /* dMIN: 88200 */
-            0x88, 0x58, 0x01, 0x00,   /* dMAX: 88200 */
-            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
-
-            /* Subrange 4: 96000 Hz (0x00017700) */
-            0x00, 0x77, 0x01, 0x00,   /* dMIN: 96000 */
-            0x00, 0x77, 0x01, 0x00,   /* dMAX: 96000 */
-            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
-
-            /* Subrange 5: 176400 Hz (0x0002B110) */
-            0x10, 0xB1, 0x02, 0x00,   /* dMIN: 176400 */
-            0x10, 0xB1, 0x02, 0x00,   /* dMAX: 176400 */
-            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
-
-            /* Subrange 6: 192000 Hz (0x0002EE00, native) */
+            /* Subrange 1: 192000 Hz (0x0002EE00, native) */
             0x00, 0xEE, 0x02, 0x00,   /* dMIN: 192000 */
             0x00, 0xEE, 0x02, 0x00,   /* dMAX: 192000 */
             0x00, 0x00, 0x00, 0x00    /* dRES: 0 (discrete) */
@@ -915,6 +889,14 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
                                      (FAR struct usb_strdesc_s *)ctrlreq->buf);
                 break;
 
+              case USB_DESC_TYPE_BOS:
+                /* MS OS 2.0 entry point (needs bcdUSB >= 0x0201).
+                 * Linux ignores the unknown platform capability.
+                 */
+                memcpy(ctrlreq->buf, g_uac2_bos_desc, g_uac2_bos_desc_len);
+                ret = g_uac2_bos_desc_len;
+                break;
+
               default:
                 break;
               }
@@ -926,11 +908,10 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
             {
               /* Log negotiated USB speed: 2=FULL (12Mbps, 192k impossible),
                * 3=HIGH (480Mbps, required for 192k/24bit). */
-              printf("[UAC2] SET_CONFIG %u, USB speed=%u (%s)\n",
+              UAC2_TPRINTF("[UAC2] SET_CONFIG %u, USB speed=%u (%s)\n",
                      (unsigned)value, (unsigned)dev->speed,
                      (dev->speed == 3) ? "HIGH-480M" :
                      (dev->speed == 2) ? "FULL-12M" : "OTHER");
-              fflush(stdout);
               ret = uac2_setconfig(priv, (uint8_t)value);
               if (ret == 0)
                 {
@@ -959,13 +940,11 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
                * (dataout == NULL). A synthesized alt > 2 returns -EINVAL
                * and STALLs EP0 after the real path already ACKed.
                */
-              printf("[UAC2] SET_IF if=%u alt=%u via=%s\n",
+              UAC2_TPRINTF("[UAC2] SET_IF if=%u alt=%u via=%s\n",
                      (unsigned)index, (unsigned)value,
                      dataout ? "ep0" : "SI-synth");
-              fflush(stdout);
               ret = uac2_setinterface(priv, (uint8_t)index, (uint8_t)value);
-              printf("[UAC2] SET_IF -> %d\n", ret);
-              fflush(stdout);
+              UAC2_TPRINTF("[UAC2] SET_IF -> %d\n", ret);
             }
           break;
 
@@ -1072,6 +1051,15 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
             }
         }
     }
+  /* MS vendor requests (WinUSB auto-bind; ISR context: memcpy only) */
+  else if ((type & USB_REQ_TYPE_MASK) == USB_REQ_TYPE_VENDOR)
+    {
+      if (req == UAC2_MS_VENDOR_CODE && index == UAC2_MSOS20_INDEX)
+        {
+          memcpy(ctrlreq->buf, g_uac2_msos20_set, g_uac2_msos20_set_len);
+          ret = g_uac2_msos20_set_len;
+        }
+    }
 
   /* Record to lock-free setup trace log */
   uac2_log_setup(type, req, value, index, len, (int16_t)ret);
@@ -1130,9 +1118,10 @@ void uac2_get_status(bool *is_streaming, uint8_t *alt_setting, uint32_t *sample_
   if (is_streaming) *is_streaming = g_uac2_dev.is_streaming;
   if (alt_setting) *alt_setting = g_uac2_dev.alt_setting;
   if (sample_rate) *sample_rate = g_uac2_dev.sample_rate;
-  if (underrun) *underrun = g_uac2_dev.ringbuf.underrun_count;
-  if (overrun) *overrun = g_uac2_dev.ringbuf.overrun_count;
-  if (buffered) *buffered = uac2_ringbuf_available_read(&g_uac2_dev.ringbuf);
+  /* 実給電リング（g_pcm_ring）の統計を返す。旧g_uac2_dev.ringbufは
+   * 死にバッファだったため参照しない（Claude指摘）。
+   */
+  uac2_audio_get_ring_stats(underrun, overrun, buffered);
 }
 
 void uac2_dump_setup_logs(void)

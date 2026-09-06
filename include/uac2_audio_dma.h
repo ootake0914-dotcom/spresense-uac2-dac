@@ -45,6 +45,34 @@ int uac2_audio_write(const void *buffer, size_t bytes);
 void uac2_audio_set_volume(uint8_t volume_percent);
 void uac2_audio_set_mute(bool mute);
 
+/* 排出路の診断情報取得（1秒周期の状態表示用。無音時の切り分けに使用） */
+void uac2_audio_get_stats(bool *playing, int *fd, uint32_t *enq,
+                          uint32_t *deq, uint32_t *udr, uint32_t *rst,
+                          int *freetop);
+
+/* 一時診断用：給電データ有無カウンタの取得 */
+void uac2_audio_get_data_stats(uint32_t *data_chunks, uint32_t *silent_chunks);
+
+/* 一時診断用：部分/空APBカウンタの取得 */
+void uac2_audio_get_feed_stats(uint32_t *partial_chunks, uint32_t *empty_chunks);
+
+/* 実給電リング統計の取得（[UAC2]表示用。死にバッファ参照の置換） */
+void uac2_audio_get_ring_stats(uint32_t *underrun, uint32_t *overrun,
+                               uint32_t *buffered);
+
+/* APBシーケンス追跡統計の取得（リプレイ/ドロップ判定用） */
+void uac2_audio_get_seq_stats(uint32_t *dup, uint32_t *gap,
+                              uint32_t *first_dup, uint32_t *first_gap);
+
+/* サーボ統計の取得 */
+void uac2_audio_get_servo_stats(uint32_t *dropped, uint32_t *dupped);
+
+/* 一時診断用：ドライバ通知メッセージ到着カウンタの取得 */
+void uac2_audio_get_msg_stats(uint32_t *msg_underrun, uint32_t *msg_ioerror);
+
+/* オーディオクロックの有効状態（エンジン不動時の切り分け用） */
+bool uac2_audio_clock_state(void);
+
 /* Legacy wrappers (signatures frozen by uac2_main.c) */
 
 int uac2_audio_dma_init(void);

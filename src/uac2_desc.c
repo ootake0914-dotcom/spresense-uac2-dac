@@ -15,14 +15,14 @@
 #include <nuttx/usb/audio.h>
 #include "uac2_desc.h"
 
-/* Standard Device Descriptor (USB 2.00, Misc/IAD class) */
+/* Standard Device Descriptor (USB 2.01 for BOS/MS OS 2.0, Misc/IAD class) */
 const struct usb_devdesc_s g_uac2_device_desc = {
     USB_SIZEOF_DEVDESC,       /* len */
     USB_DESC_TYPE_DEVICE,     /* type */
     {
-      LSBYTE(0x0200),
-      MSBYTE(0x0200)
-    },                        /* usb (BCD 2.00) */
+      LSBYTE(0x0201),
+      MSBYTE(0x0201)
+    },                        /* usb (BCD 2.01: BOS allowed, wire-compatible) */
     USB_CLASS_MISC,           /* classid */
     0x02,                     /* subclass: Common Class */
     0x01,                     /* protocol: IAD */
@@ -51,8 +51,8 @@ static const struct usb_qualdesc_s g_uac2_qualdesc =
     USB_SIZEOF_QUALDESC,      /* len */
     USB_DESC_TYPE_DEVICEQUALIFIER,
     {
-      LSBYTE(0x0200),
-      MSBYTE(0x0200)
+      LSBYTE(0x0201),
+      MSBYTE(0x0201)
     },
     USB_CLASS_MISC,
     0x02,
@@ -62,6 +62,60 @@ static const struct usb_qualdesc_s g_uac2_qualdesc =
     0
 };
 #endif
+
+/* BOS descriptor (33B): MS OS 2.0 platform capability only.
+ * Lets Windows >= 8.1 auto-bind WinUSB (no INF/signing) for MI_01.
+ */
+const uint8_t g_uac2_bos_desc[] =
+{
+    0x05,                               /* bLength */
+    USB_DESC_TYPE_BOS,                  /* bDescriptorType: BOS (0x0F) */
+    0x21, 0x00,                         /* wTotalLength: 33 */
+    0x01,                               /* bNumDeviceCaps: 1 */
+    /* Microsoft OS 2.0 Platform Capability (28B) */
+    0x1C,                               /* bLength */
+    0x10,                               /* bDescriptorType: DEVICE_CAPABILITY */
+    0x05,                               /* bDevCapabilityType: PLATFORM */
+    0x00,                               /* bReserved */
+    0xDF, 0x60, 0xDD, 0xD8,             /* MS OS 2.0 UUID */
+    0x89, 0x45, 0xC7, 0x4C,
+    0x9C, 0xD2, 0x65, 0x9D,
+    0x9E, 0x64, 0x8A, 0x9F,
+    UAC2_MS_VENDOR_CODE,                /* bVendorCode */
+    0x00                                /* bAltEnumCode */
+};
+
+/* MS OS 2.0 Descriptor Set (46B): MI_01 (AS streaming) -> WINUSB.
+ * AC (MI_00) stays with usbaudio2 (fails as before, harmless).
+ */
+const uint8_t g_uac2_msos20_set[] =
+{
+    /* Set header (10B) */
+    0x0A, 0x00,                         /* wLength */
+    0x00, 0x00,                         /* wDescriptorType: SET_HEADER */
+    0x00, 0x00, 0x03, 0x06,             /* dwWindowsVersion 8.1 */
+    0x2E, 0x00,                         /* wTotalLength: 46 */
+    /* Configuration subset (8B) */
+    0x08, 0x00,                         /* wLength */
+    0x01, 0x00,                         /* wDescriptorType: CONFIG_SUBSET */
+    UAC2_CONFIG_ID,                     /* bConfigurationValue */
+    0x00,                               /* bReserved */
+    0x24, 0x00,                         /* wTotalLength: 36 */
+    /* Function subset (8B): AS interface only */
+    0x08, 0x00,                         /* wLength */
+    0x02, 0x00,                         /* wDescriptorType: FUNCTION_SUBSET */
+    UAC2_IF_AUDIO_STREAMING,            /* bFirstInterface */
+    0x00,                               /* bReserved */
+    0x1C, 0x00,                         /* wTotalLength: 28 */
+    /* Compatible ID (20B): WINUSB */
+    0x14, 0x00,                         /* wLength */
+    0x03, 0x00,                         /* wDescriptorType: COMPATIBLE_ID */
+    'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+const uint16_t g_uac2_bos_desc_len = sizeof(g_uac2_bos_desc);
+const uint16_t g_uac2_msos20_set_len = sizeof(g_uac2_msos20_set);
 
 #define UAC2_TEST_PURE_STANDARD_DESC 0
 

@@ -2,6 +2,8 @@
 
 Sony Spresense (CXD5602 + CXD5247) を **USB Audio Class 2.0 (UAC2) 準拠の 192kHz / 24bit ハイレゾ USB DAC** として動作させるフルスクラッチ・デバイスドライバおよびファームウェア開発プロジェクトです。
 
+**状態: FW Final-1.0 動作確認済み**（YouTube連続再生・aplay 192kHz/S32で正常動作。凍結バイナリ `nuttx.final-1.0.spk`）
+
 ---
 
 ## 1. ターゲット仕様
@@ -11,7 +13,7 @@ Sony Spresense (CXD5602 + CXD5247) を **USB Audio Class 2.0 (UAC2) 準拠の 19
 | **USB 規格** | USB 2.0 High-Speed (480 Mbps) | CXD5602 内蔵 USB PHY |
 | **オーディオ規格** | USB Audio Class 2.0 (UAC2) | **Linux (ALSA), Raspberry Pi, Volumio, Android 等で完全動作** |
 | **ストリーミング構成** | **Alt 0 単一ストリーミング** | CXD5602 シリコン制約に準拠した独自アーキテクチャ |
-| **サンプリング周波数** | **192.0 kHz** (ハイレゾ) | 48.0 kHz / 192.0 kHz 対応 |
+| **サンプリング周波数** | **192.0 kHz** (ハイレゾ、固定) | RANGEは192k-only、非対応値は192kクランプACK |
 | **ビット深度** | **24-bit** (PCM) | 32-bit コンテナ (Subslot: 4 bytes) パディング |
 | **チャンネル数** | 2ch (ステレオ L/R) | |
 | **同期方式** | **Adaptive (適応型)** / **Asynchronous** | ホスト主導レート同期 / ジッター吸収リングバッファ |
@@ -40,6 +42,7 @@ CXD5602 のシリコン製造時に焼き付けられた合成パラメータ（
 - **Linux (ALSA / `snd-usb-audio`) での完全対応（本プロジェクトの主軸）**:
   - Linux ALSA は **「Alt 0 単一ストリーミング（帯域ゼロの Alt 0 を作らず、Alt 0 に直接 Isochronous EP を配置する構成）」** を標準で完全にサポートしています。
   - 本プロジェクトでは `UAC2_SINGLE_ALT0_STREAMING = 1` を採用し、Linux / Raspberry Pi 等のオーディオトランスポート環境で最速・最高音質の 192kHz/24bit DAC を実現します。
+- **Windows について**: 標準ドライバ (`usbaudio2.sys`) は上記理由で不可。代替として **WinUSB PoC (`tools/win_poc/`)** を用意：MS OS 2.0記述子でWinUSB自動バインドし、Alt0固定で転送するユーザーモード試験（進行中）。正式カーネルドライバは凍結中。
 
 ---
 
@@ -110,10 +113,15 @@ CXD5602 のシリコン製造時に焼き付けられた合成パラメータ（
 - EP2 OUT（Adaptive Isochronous）のアロケーションとパケット受信コールバックの実装
 - 192 バイト/125us の Isochronous パケットの継続受信とロックフリーリングバッファへの蓄積
 
-### Phase 4: オーディオサブシステム (CXD5247 / S-Master) 結合【現在地】
+### Phase 4: オーディオサブシステム (CXD5247 / S-Master) 結合【完了】
 - CXD5247 S-Master DAC（`/dev/pcm0`）を 192kHz / 24bit モードで起動
 - リングバッファからオーディオ DMA への実音声データ転送パイプラインの結合
 - Linux ホストからの `aplay`（1kHz ハイレゾ音源）によるヘッドホン実音出力確認
+- Final-1.0で完成宣言：always-feed＋two-tier reserve＋retry再始動＋ERR無視＋192k-only＋ISR-safe prints＋USB demote(0xA0)＋ドリフトサーボ
+
+### Phase 5: Windows 転送 PoC【進行中】
+- MS OS 2.0記述子（BOS＋MI_01→WINUSB）でINF不要の自動バインド
+- `tools/win_poc/winusb_poc.c`（WDK不要、素のWindows SDK＋MSVCでビルド）でAlt0転送試験
 
 ---
 
@@ -122,5 +130,24 @@ CXD5602 のシリコン製造時に焼き付けられた合成パラメータ（
 - `include/`: UAC2 規格定義、ディスクリプタ構造体、リングバッファ定義
 - `src/`: UAC2 デバイスドライバ、ディスクリプタ実体、DMA ブリッジ、アプリ
 - `docs/`: 技術仕様書、クロック同期理論、再起動後ログ
-- `tools/`: Python ベースの検証・音源生成スクリプト、ログ解析ツール
+- `tools/`: Python ベースの検証・音源生成スクリプト、ログ解析ツール、`win_poc/` (Windows転送PoC)
 - `test_logs/`: ハードウェア自律 STALL 挙動を実証した生ログ（`usbmon`, シリアル）
+- `nuttx.final-1.0.spk`: 動作確認済み凍結バイナリ（そのまま焼ける）
+- `spresense_192k24b_1khz.wav`: 動作確認用1kHzテスト音源（192kHz/S32/stereo）
+
+---
+
+## 7. ビルド手順
+
+前提：Spresense SDK（`nuttx/`＋`sdk/`）、ARM GCC（`spresense-tools`）、Ubuntu/WSL。
+
+```bash
+# 既定 ($HOME/spresense, $HOME/spresense-tools) と違う場合のみ設定
+export SPRESENSE=/path/to/spresense
+export SPRESENSE_TOOLS=/path/to/spresense-tools
+export UAC2_TEST_HOST="user@linux-host"   # リモート試験用（tools/run_*.sh）
+
+./build_and_flash.sh COM6   # Linuxでは /dev/ttyUSB0 等を指定
+```
+
+`nuttx.spk` が `sdk/` に生成され、同スクリプトがそのままフラッシュする。

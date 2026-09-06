@@ -25,7 +25,7 @@
    - 直れば終了（実音は別途Step5 CXD5247復帰が必要。`uac2_audio_dma.c`は現在スタブ）
 2. 改善なしなら対話ターミナルで実行し出力全文を貼る：
    ```powershell
-   python '\\wsl.localhost\Ubuntu\home\ootak\spresense_uac2_dac\tools\wasapi_exclusive_24bit.py'
+    python '<project>\tools\wasapi_exclusive_24bit.py'
    ```
 3. 併せてCOM6（115200bps）のNSHログ（`SET_CONFIG`・`SET_CUR`・`Alt:1`の有無）を取得
 
@@ -37,7 +37,7 @@
 - Wireshark/USBPcapは未導入を確認済み
 
 ## 追記5（Linux対照＝ファーム無罪確定）
-- yuhki機で `054c:0ced` high speed認識、ALSA card1+PCM0生成。パース完全成功
+- Linux対照機で `054c:0ced` high speed認識、ALSA card1+PCM0生成。パース完全成功
 - よって不具合はWindows usbaudio2固有の検証規則
 
 ## 追記7（Rev15でNSH完全可視化）
@@ -49,3 +49,34 @@
 - cap_serial.pyがDTRアサート＝毎回MCUリブートしていた。12↔1・番号上昇・EPIPE嵐の主因は自 rig
 - cap_serial.pyを受動化（cap_pulse.pyのみ明示リブート用）。以後リブートなしで計測
 - 12レンジ1回は「無擾乱・ settled 状態」の真値の可能性。4分静置後に再照会する
+
+## 追記11（2026-09-06 Linux完走：発音＋ERR二相＋PipeWire汚染。FW Rev45）
+- 方針転換済み：CXD5602はAlt>0自律STALLのためWindows不可、Linux/RPi/Volumio専用DAC化
+- Rev42（SDK err分岐を停止→クリア継続化）で発音達成。ただし試聴でノイズ・途切れあり
+- ERRは2相：slow相（~2-4/s、SNAP=0x03/0x13/mon0x00030000）⇔爆発相（~760/s全バッファ、SNAP=0x02/0x12/mon0x00020001）。自己限定・周期的（ビート状）。エンジン流量は両相とも不変
+- 発火開始は非決定的（起動後8s/22s/70s/100s/245s）。再生は加速要因だが必須ではない。アイドルのみ240sでも発火
+- H-α（in-flight16固着）→Rev43上限14でも発火継続で後退。Rev44 dither（12-14変動）でも発火。位相固定説は不十分
+- H-β（autosuspend）→ power/control=on で除外確定
+- 供給/需要：APB=2048B(256frame@192k/S32)。engine消費1.536MB/s。aplay192k/S32供給=一致のはず。PipeWireが48k/S32(384KB/s)で掴むとpartial-APB 81%
+- Rev45でpartial/empty計装：[FEED] partial（n<2048ゼロ埋め）、empty（n==0）。aud_udrはpartialを検出しない
+- Linux対照機の注意：PipeWire＋GNOME設定サウンドパネルがcard1 pcmC1D0pをRUNNING保持（48k/S32）→aplayはbusy失敗。設定を閉じれば解放のはず。python（not python3）使用
+- 取得ログ：%TEMP%\opencode\rev42d/c43/c44/c45*.txt（[AUD]1s＋[REG]3s＋ERRSNAP）
+- 次手：(1)設定を閉じてaplay192kでpartial計測→供給ジッタ説確定 (2)SAMPLING_FREQ受入拒否（48k誤設定防止） (3)ポンプUSB起床復活＋高速tick (4)TRMでOUT_ERR定義確認
+- 一時変更の戻し忘れ注意：cxd56_audio_dma.c（err分岐・snap・errcont・snap2）、uac2_audio_dma.c（dither・上限14・partial計数）、uac2_main.c（表示）
+
+## 追記12（2026-09-06 マイルストーン達成：Rev63で12/12＋5分連続クリーン）
+- 凍結バイナリ：nuttx.rev63-clean.spk（232768B）。動作FW Rev63そのもの
+- TRM確定：err_I2S1O=フェッチ遅延のサンプル脱落。USBよりAudio IRQ優先で消滅
+- 最終構成：always-feed＋two-tier reserve＋retry再始動＋ERR無視＋192k-only＋clamp-ACK＋SILENT_DIAG=1＋USB demote(0xA0)
+- 実績：12連続2秒再生＋5分連続(S32/192k)全区間クリーン、hostエラーゼロ
+- 既知の残件：起動直後underrun×2程度は出るが自動REVIVED（無音区間のみ、可聴影響なし）。slow相ERRは残存するも無害（dup=0確認）。
+- PREPARE ETIMEDOUTはRev60-silent以降出ず（print系wedgeの副産物だった疑い濃厚）
+- 次：目戻し計数確認→掃除（診断除去）→30分soak→cold boot×10→完成宣言
+
+## 追記13（2026-09-07 Final-1.0 完成宣言）
+- 凍結バイナリ：nuttx.final-1.0.spk（235520B）。動作FW Final-1.0そのもの
+- 真犯人確定：USB-ISR内printf（completion/EP0 setup/FU/START表示）。逆アセで到達＋ガードを機械確認
+- 修正：UAC2_TPRINTF（up_interrupt_contextでタスク限定）＋5247 hiresは無音化のため不採用（48k-modeのままが有音実績）
+- 水晶再計算：49.152MHz系で192kは整数分周exact、誤差<140ppm（soak bound）。粗い誤差なし
+- 実績：YouTube連続再生ずっと正常（10秒崩壊も解消）。aplay 1kHz正常
+- 残件（無害・将来用）：SDK cxd56_audio_set_hires_outputは残置未使用、diag_drain/diag_tickは未使用、refill再採番で偽dup計数が出ることがある（表示のみ）

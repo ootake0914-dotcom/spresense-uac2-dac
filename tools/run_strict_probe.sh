@@ -1,7 +1,9 @@
 #!/bin/bash
 set -e
 
-ssh -o BatchMode=yes yuhki@100.117.104.111 bash << 'REMOTE_EOF'
+TEST_HOST="${UAC2_TEST_HOST:?Set UAC2_TEST_HOST (e.g. user@linux-host) for remote audio tests}"
+
+ssh -o BatchMode=yes "$TEST_HOST" bash << 'REMOTE_EOF'
 cat << 'PY_EOF' > /tmp/strict_probe.py
 import fcntl, os, sys, struct, time
 
@@ -39,7 +41,7 @@ echo "3-3:1.1" | sudo tee /sys/bus/usb/drivers/snd-usb-audio/unbind 2>/dev/null 
 
 DEVNUM=$(cat /sys/bus/usb/devices/3-3/devnum)
 DEVPATH=$(printf "/dev/bus/usb/003/%03d" $DEVNUM)
-echo "[YUHKI] Target device: $DEVPATH (devnum $DEVNUM)"
+echo "[REMOTE] Target device: $DEVPATH (devnum $DEVNUM)"
 
 # Start usbmon
 sudo rm -f /tmp/usbmon_strict.log
@@ -51,5 +53,5 @@ sleep 1
 sudo python3 /tmp/strict_probe.py "$DEVPATH"
 
 wait $MON_PID 2>/dev/null || true
-echo "[YUHKI] usbmon captured."
+echo "[REMOTE] usbmon captured."
 REMOTE_EOF

@@ -1,6 +1,10 @@
 *.o
+*.obj
+*.exe
 *.built
 .built
 *.dep
 Make.dep
 .depend
+__pycache__/
+*.pyc

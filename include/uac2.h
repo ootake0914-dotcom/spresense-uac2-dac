@@ -8,6 +8,20 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <arch/irq.h>
+
+/* ISR-safe print (Rev66): task context only.
+ * USB completion (ISO) and EP0 setup run in USB interrupt context,
+ * where console output wedges/corrupts the port (B1). up_interrupt_context()
+ * is a static inline in arch/irq.h (no call cost issue).
+ */
+#define UAC2_TPRINTF(...) do { if (!up_interrupt_context()) { printf(__VA_ARGS__); fflush(stdout); } } while (0)
+
+/* TEMP-DIAG: periodic-print silence switch.
+ * Rev65-eyes: temporarily 0 for servo verification (short run only).
+ */
+#define UAC2_SILENT_DIAG 0
 
 /* Audio Function Subclass Codes */
 #define UAC2_SUBCLASS_UNDEFINED       0x00

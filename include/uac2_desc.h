@@ -90,9 +90,19 @@
 
 #define UAC2_EP0MAXPACKET             64
 
+/* MS OS 2.0 vendor code (BOS platform capability + vendor requests).
+ * WinUSB auto-bind for MI_01, no INF/signing needed on Win >= 8.1.
+ */
+#define UAC2_MS_VENDOR_CODE           0x02
+#define UAC2_MSOS20_INDEX             0x07
+
 extern const struct usb_devdesc_s g_uac2_device_desc;
 extern const uint8_t g_uac2_config_desc_hs[];
 extern const uint16_t g_uac2_config_desc_hs_len;
+extern const uint8_t g_uac2_bos_desc[];
+extern const uint16_t g_uac2_bos_desc_len;
+extern const uint8_t g_uac2_msos20_set[];
+extern const uint16_t g_uac2_msos20_set_len;
 
 /* Descriptor helpers (pattern follows cdcacm_mk*desc) */
 FAR const struct usb_devdesc_s *uac2_getdevdesc(void);
