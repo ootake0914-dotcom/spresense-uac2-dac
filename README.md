@@ -1,73 +1,86 @@
-# Spresense 192kHz / 24bit ハイレゾ USB DAC (UAC2) プロジェクト
+# Spresense 192kHz / 24-bit Hi-Res USB DAC (UAC2)
 
-Sony Spresense (CXD5602 + CXD5247) を **USB Audio Class 2.0 (UAC2) 準拠の 192kHz / 24bit ハイレゾ USB DAC** として動作させるフルスクラッチ・デバイスドライバおよびファームウェア開発プロジェクトです。
+Turn a Sony Spresense (CXD5602 + CXD5247) into a **USB Audio Class 2.0 (UAC2)
+192kHz / 24-bit hi-res USB DAC**, with a from-scratch NuttX device driver
+and firmware.
 
-**状態: FW Final-1.0 動作確認済み**（YouTube連続再生・aplay 192kHz/S32で正常動作。凍結バイナリ `nuttx.final-1.0.spk`）
+**Status: FW Final-1.0 verified working** (continuous YouTube playback and
+192kHz/S32 `aplay` verified on Linux; frozen binary `nuttx.final-1.0.spk`).
 
 ---
 
-## 1. ターゲット仕様
+## 1. Target specification
 
-| 項目 | 仕様 | 備考 |
+| Item | Spec | Notes |
 |---|---|---|
-| **USB 規格** | USB 2.0 High-Speed (480 Mbps) | CXD5602 内蔵 USB PHY |
-| **オーディオ規格** | USB Audio Class 2.0 (UAC2) | **Linux (ALSA), Raspberry Pi, Volumio, Android 等で完全動作** |
-| **ストリーミング構成** | **Alt 0 単一ストリーミング** | CXD5602 シリコン制約に準拠した独自アーキテクチャ |
-| **サンプリング周波数** | **192.0 kHz** (ハイレゾ、固定) | RANGEは192k-only、非対応値は192kクランプACK |
-| **ビット深度** | **24-bit** (PCM) | 32-bit コンテナ (Subslot: 4 bytes) パディング |
-| **チャンネル数** | 2ch (ステレオ L/R) | |
-| **同期方式** | **Adaptive (適応型)** / **Asynchronous** | ホスト主導レート同期 / ジッター吸収リングバッファ |
-| **DAC / 出力** | Sony CXD5247 (内蔵 DAC + S-Master アンプ) | 3.5mm ステレオミニジャック出力 |
+| **USB** | USB 2.0 High-Speed (480 Mbps) | CXD5602 built-in USB PHY |
+| **Audio class** | USB Audio Class 2.0 (UAC2) | Fully working on **Linux (ALSA), Raspberry Pi, Volumio, Android, etc.** |
+| **Streaming layout** | **Single Alt 0 streaming** | Proprietary architecture conforming to CXD5602 silicon limits |
+| **Sample rate** | **192.0 kHz** (hi-res, fixed) | RANGE advertises 192k-only; other values are clamped to 192k with ACK |
+| **Bit depth** | **24-bit** (PCM) | 32-bit container (Subslot: 4 bytes) |
+| **Channels** | 2ch (stereo L/R) | |
+| **Sync mode** | **Adaptive** | Host-paced rate sync + jitter-absorbing ring buffer |
+| **DAC / output** | Sony CXD5247 (DAC + S-Master amp) | 3.5 mm stereo jack |
 
 ---
 
-## 2. 【最重要】CXD5602 ハードウェア (UDC IP) の仕様と制約
+## 2. 【Key】CXD5602 hardware (UDC IP) constraints
 
-実機での厳密な USB バスモニタ解析（`usbmon`）および **CXD5602 User Manual 第3.18節「USB」（p.1118〜1124）** の精査により、コントローラ IP（Synopsys DesignWare `DWC_d20ahb`）に関する決定的な物理仕様が判明・実証されました。
+Close analysis of live USB traces (`usbmon`) and **CXD5602 User Manual
+Section 3.18 "USB" (p.1118-1124)** proved decisive facts about the
+controller IP (Synopsys DesignWare `DWC_d20ahb`).
 
-### 2.1 シリコン固定パラメータ（User Manual p.1122〜1123）
-CXD5602 のシリコン製造時に焼き付けられた合成パラメータ（Configuration Parameters）は以下の通りです：
+### 2.1 Silicon-fixed parameters (User Manual p.1122-1123)
+Synthesis-time configuration parameters burned into the silicon:
 
-1. **Alternate Setting 数の上限値（p.1123 Table USB-46）**:
+1. **Max alternate settings (p.1123 Table USB-46)**:
    - `Max Alternate Setting in Interfaces 0..14 Configuration 1` = **`1 (every case)`**
-   - 各インターフェースがサポートする Alternate Setting の総数は **「1 個（Alt 0 のみ）」** にハードコードされています。
-2. **ハードウェアによる自律 STALL 動作仕様（p.1122 Table USB-45）**:
+   - Each interface supports exactly **one alternate setting (Alt 0 only)**.
+2. **Autonomous hardware STALL (p.1122 Table USB-45)**:
    - *"The UDC20-AHB Subsystem issues a STALL handshake for command interfaces [and settings] not supported in Configuration 1."*
-   - サポート範囲外（Alt > 0）の `SET_INTERFACE` リクエストを受信した場合、UDC ハードウェアプロトコルエンジンは **CPU（NuttX / DCD）に割り込みを一切上げることなく、137〜250 µs で自律的に STALL（-32 / EPIPE）を返します。**
+   - A `SET_INTERFACE` for Alt > 0 is answered with an **autonomous STALL
+     (-32 / EPIPE) in 137-250 us, with no interrupt raised to the CPU
+     (NuttX / DCD) at all.**
 
-### 2.2 OS ごとの対応と設計方針
-- **Windows 10/11 (`usbaudio2.sys`) の物理的不可能性**:
-  - Microsoft 公式仕様上、AS（Audio Streaming）インターフェースは「帯域ゼロの Alt 0 から始まり、ストリーミング時に必ず Alt > 0 へ切り替える（Alt 0 単独ストリーミングは非対応）」と定められています。
-  - そのため、Alt > 0 をハードウェアが自律 STALL する Spresense では、Windows 標準ドライバで再生ピンを開くことが物理的に不可能です。
-- **Linux (ALSA / `snd-usb-audio`) での完全対応（本プロジェクトの主軸）**:
-  - Linux ALSA は **「Alt 0 単一ストリーミング（帯域ゼロの Alt 0 を作らず、Alt 0 に直接 Isochronous EP を配置する構成）」** を標準で完全にサポートしています。
-  - 本プロジェクトでは `UAC2_SINGLE_ALT0_STREAMING = 1` を採用し、Linux / Raspberry Pi 等のオーディオトランスポート環境で最速・最高音質の 192kHz/24bit DAC を実現します。
-- **Windows について**: 標準ドライバ (`usbaudio2.sys`) は上記理由で不可。代替として **WinUSB PoC (`tools/win_poc/`)** を用意：MS OS 2.0記述子でWinUSB自動バインドし、Alt0固定で転送するユーザーモード試験（進行中）。正式カーネルドライバは凍結中。
-
----
-
-## 3. 帯域・パケット計算
-
-- **サンプリングレート Fs**: 192,000 Hz
-- **フレームあたりのデータ長**: 2 ch * 4 Bytes (32bit container) = 8 Bytes
-- **総転送ビットレート**: 192,000 * 8 * 8 = 12.288 Mbps
-- **USB High-Speed マイクロフレーム周期**: 125 us (毎秒 8,000 回)
-- **1 マイクロフレームあたりのサンプル数**: 192,000 / 8,000 = 24 samples/uframe
-- **1 マイクロフレームあたりのペイロードサイズ**: 24 * 8 = 192 Bytes
-- **wMaxPacketSize**: 200 Bytes（ジッター・クロックドリフト耐性マージンを含む）
+### 2.2 Per-OS policy
+- **Windows 10/11 (`usbaudio2.sys`): not possible with the stock driver**:
+  - Per Microsoft's spec, an AS interface starts at zero-bandwidth Alt 0
+    and must switch to Alt > 0 for streaming (Alt-0-only streaming is
+    unsupported). On Spresense, Alt > 0 is STALLed by hardware, so the
+    stock driver can never open a playback pin. Physically impossible.
+- **Linux (ALSA / `snd-usb-audio`): fully supported (this project's focus)**:
+  - Linux ALSA natively supports **single-Alt-0 streaming (isochronous EP
+    placed directly on Alt 0, no zero-bandwidth Alt 0)**.
+  - This project uses `UAC2_SINGLE_ALT0_STREAMING = 1` for a 192kHz/24-bit
+    DAC on Linux / Raspberry Pi and similar transports.
+- **Windows alternative**: a **WinUSB PoC (`tools/win_poc/`)** is in
+  progress — MS OS 2.0 descriptors auto-bind WinUSB, and a user-mode
+  transfer test streams with Alt 0 fixed. A formal kernel driver is on hold.
 
 ---
 
-## 4. システムアーキテクチャ
+## 3. Bandwidth / packet math
+
+- **Sample rate Fs**: 192,000 Hz
+- **Bytes per frame**: 2 ch * 4 bytes (32-bit container) = 8 bytes
+- **Total bit rate**: 192,000 * 8 * 8 = 12.288 Mbps
+- **High-Speed microframe period**: 125 us (8,000/sec)
+- **Samples per microframe**: 192,000 / 8,000 = 24 samples/uframe
+- **Payload per microframe**: 24 * 8 = 192 bytes
+- **wMaxPacketSize**: 200 bytes (jitter / clock-drift headroom included)
+
+---
+
+## 4. System architecture
 
 ```
 +---------------------------------------------------------------+
 |                       Host PC / Raspberry Pi                  |
 |                 Linux ALSA (snd-usb-audio driver)             |
 +---------------------------------------------------------------+
-                              |  USB 2.0 High-Speed (480 Mbps)
-                              |  SET_INTERFACE (Interface 1, Alt 0) -> ACK
-                              v
+                               |  USB 2.0 High-Speed (480 Mbps)
+                               |  SET_INTERFACE (Interface 1, Alt 0) -> ACK
+                               v
 +---------------------------------------------------------------+
 |                 Sony Spresense (CXD5602 Main Core)            |
 |                                                               |
@@ -78,7 +91,7 @@ CXD5602 のシリコン製造時に焼き付けられた合成パラメータ（
 |       |                                                       |
 |  [UAC2 Class Driver (uac2_driver.c)]                          |
 |       |                                                       |
-|  [Jitter-Absorbing Lock-Free Ring Buffer (uac2_ringbuf.c)]    |
+|  [Jitter-Absorbing Lock-Free Ring Buffer (128KB SPSC)]        |
 |       |                                                       |
 |  [Audio Subsystem / CXD5247 DMA Bridge (uac2_audio_dma.c)]    |
 |       | (/dev/pcm0 - 192kHz / 24-in-32bit Slot)               |
@@ -95,59 +108,76 @@ CXD5602 のシリコン製造時に焼き付けられた合成パラメータ（
     [3.5mm Headphone Jack Output]
 ```
 
----
-
-## 5. 開発フェーズ (ロードマップ)
-
-### Phase 1: USB 認識と UAC2 ディスクリプタの確立【完了】
-- NuttX `usbdevclass_driver_s` の骨格作成
-- UAC2 ディスクリプタツリー（IAD, AC, AS, ClockSource, Terminals）の構築
-- Linux ALSA (`snd-usb-audio`) での PCM デバイス完全認識（カード番号付与、192kHz/24bit 認識）
-
-### Phase 2: シリコン制約の解明とハードウェア検証【完了】
-- Alt > 0 での自律 STALL 現象を `usbmon` 生ログにて厳密実証（137〜250 µs）
-- CXD5602 User Manual（p.1122〜1123 Table USB-45/46）の精査により、シリコンの「Alternate Setting 0 のみ対応」仕様を完全証明
-- `UAC2_SINGLE_ALT0_STREAMING = 1` による Alt 0 単一ストリーミング構成を確定
-
-### Phase 3: Isochronous ストリーミング受信とリングバッファ供給【完了】
-- EP2 OUT（Adaptive Isochronous）のアロケーションとパケット受信コールバックの実装
-- 192 バイト/125us の Isochronous パケットの継続受信とロックフリーリングバッファへの蓄積
-
-### Phase 4: オーディオサブシステム (CXD5247 / S-Master) 結合【完了】
-- CXD5247 S-Master DAC（`/dev/pcm0`）を 192kHz / 24bit モードで起動
-- リングバッファからオーディオ DMA への実音声データ転送パイプラインの結合
-- Linux ホストからの `aplay`（1kHz ハイレゾ音源）によるヘッドホン実音出力確認
-- Final-1.0で完成宣言：always-feed＋two-tier reserve＋retry再始動＋ERR無視＋192k-only＋ISR-safe prints＋USB demote(0xA0)＋ドリフトサーボ
-
-### Phase 5: Windows 転送 PoC【進行中】
-- MS OS 2.0記述子（BOS＋MI_01→WINUSB）でINF不要の自動バインド
-- `tools/win_poc/winusb_poc.c`（WDK不要、素のWindows SDK＋MSVCでビルド）でAlt0転送試験
+Firmware internals (Final-1.0): always-feed pump (never starves the
+engine), two-tier ring reserve, guarded retry-restart (never calls the
+hanging STOP blindly), TRM-defined ERR tolerance, 192k-only RANGE with
+clamp-ACK, ISR-safe prints (no `printf` in USB interrupt context), USB IRQ
+demoted below audio, and a clock-drift servo (single-frame drop/repeat,
+inaudible) that bounds the ring level forever.
 
 ---
 
-## 6. ディレクトリ構成
+## 5. Development phases (roadmap)
 
-- `include/`: UAC2 規格定義、ディスクリプタ構造体、リングバッファ定義
-- `src/`: UAC2 デバイスドライバ、ディスクリプタ実体、DMA ブリッジ、アプリ
-- `docs/`: 技術仕様書、クロック同期理論、再起動後ログ
-- `tools/`: Python ベースの検証・音源生成スクリプト、ログ解析ツール、`win_poc/` (Windows転送PoC)
-- `test_logs/`: ハードウェア自律 STALL 挙動を実証した生ログ（`usbmon`, シリアル）
-- `nuttx.final-1.0.spk`: 動作確認済み凍結バイナリ（そのまま焼ける）
-- `spresense_192k24b_1khz.wav`: 動作確認用1kHzテスト音源（192kHz/S32/stereo）
+### Phase 1: USB enumeration and UAC2 descriptors【Done】
+- NuttX `usbdevclass_driver_s` skeleton
+- UAC2 descriptor tree (IAD, AC, AS, ClockSource, Terminals)
+- Full PCM device recognition in Linux ALSA (`snd-usb-audio`), 192kHz/24-bit
+
+### Phase 2: Silicon-constraint analysis and HW verification【Done】
+- Autonomous STALL on Alt > 0 proven with raw `usbmon` logs (137-250 us)
+- "Alt 0 only" silicon spec proven via CXD5602 User Manual (Table USB-45/46)
+- `UAC2_SINGLE_ALT0_STREAMING = 1` Alt-0-only streaming layout fixed
+
+### Phase 3: Isochronous streaming receive + ring buffer feed【Done】
+- EP2 OUT (Adaptive Isochronous) allocation and packet receive callbacks
+- Continuous 192 bytes/125us isochronous receive into a lock-free ring buffer
+
+### Phase 4: Audio subsystem (CXD5247 / S-Master) integration【Done】
+- CXD5247 S-Master DAC (`/dev/pcm0`) at 192kHz / 24-bit
+- Real audio data pipeline from ring buffer to audio DMA
+- Headphone output verified with `aplay` (1kHz hi-res source) on a Linux host
+- Declared complete as Final-1.0
+
+### Phase 5: Windows transfer PoC【In progress】
+- MS OS 2.0 descriptors (BOS + MI_01 -> WINUSB) for INF-free auto bind
+- `tools/win_poc/winusb_poc.c` (plain Windows SDK + MSVC, no WDK) for Alt 0
+  transfer tests
 
 ---
 
-## 7. ビルド手順
+## 6. Directory layout
 
-前提：Spresense SDK（`nuttx/`＋`sdk/`）、ARM GCC（`spresense-tools`）、Ubuntu/WSL。
+- `include/`: UAC2 spec defines, descriptor structs, ring buffer
+- `src/`: UAC2 device driver, descriptor tables, DMA bridge, app
+- `docs/`: tech notes, clock-sync theory, reboot-resume log (Japanese)
+- `tools/`: verification / tone-generation scripts, log tools, `win_poc/` (Windows transfer PoC)
+- `test_logs/`: raw logs (`usbmon`, serial) proving the HW autonomous STALL
+- `nuttx.final-1.0.spk`: verified frozen binary (flash as-is)
+- `spresense_192k24b_1khz.wav`: 1kHz test tone (192kHz/S32/stereo)
+
+---
+
+## 7. Build
+
+Prerequisites: Spresense SDK (`nuttx/` + `sdk/`), ARM GCC (`spresense-tools`),
+Ubuntu/WSL.
 
 ```bash
-# 既定 ($HOME/spresense, $HOME/spresense-tools) と違う場合のみ設定
+# Only needed if different from the defaults ($HOME/spresense, $HOME/spresense-tools)
 export SPRESENSE=/path/to/spresense
 export SPRESENSE_TOOLS=/path/to/spresense-tools
-export UAC2_TEST_HOST="user@linux-host"   # リモート試験用（tools/run_*.sh）
+export UAC2_TEST_HOST="user@linux-host"   # for tools/run_*.sh remote tests
 
-./build_and_flash.sh COM6   # Linuxでは /dev/ttyUSB0 等を指定
+./build_and_flash.sh COM6   # e.g. /dev/ttyUSB0 on Linux
 ```
 
-`nuttx.spk` が `sdk/` に生成され、同スクリプトがそのままフラッシュする。
+`nuttx.spk` is generated under `sdk/` and flashed by the same script.
+
+---
+
+## 8. License
+
+Apache License 2.0 (see `LICENSE`). SDK modifications made for this project
+are distributed as documented source procedures; the SDK tree itself is not
+redistributed here.

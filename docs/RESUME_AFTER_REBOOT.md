@@ -23,10 +23,7 @@
 ## 再起動後の手順
 1. `mmsys.cpl` → Spresense →「詳細」「レベル」確認
    - 直れば終了（実音は別途Step5 CXD5247復帰が必要。`uac2_audio_dma.c`は現在スタブ）
-2. 改善なしなら対話ターミナルで実行し出力全文を貼る：
-   ```powershell
-    python '<project>\tools\wasapi_exclusive_24bit.py'
-   ```
+2. ~~改善なしなら対話ターミナルで実行し出力全文を貼る~~（当該スクリプトは公開ツリーから削除。Windows標準ドライバ経路は放棄済み）
 3. 併せてCOM6（115200bps）のNSHログ（`SET_CONFIG`・`SET_CUR`・`Alt:1`の有無）を取得
 
 ## 追記4（12vs1未解決・次手確定）
@@ -65,7 +62,7 @@
 - 一時変更の戻し忘れ注意：cxd56_audio_dma.c（err分岐・snap・errcont・snap2）、uac2_audio_dma.c（dither・上限14・partial計数）、uac2_main.c（表示）
 
 ## 追記12（2026-09-06 マイルストーン達成：Rev63で12/12＋5分連続クリーン）
-- 凍結バイナリ：nuttx.rev63-clean.spk（232768B）。動作FW Rev63そのもの
+- 凍結バイナリ：nuttx.rev63-clean.spk（公開ツリーからは削除。後継 nuttx.final-1.0.spk を使用）
 - TRM確定：err_I2S1O=フェッチ遅延のサンプル脱落。USBよりAudio IRQ優先で消滅
 - 最終構成：always-feed＋two-tier reserve＋retry再始動＋ERR無視＋192k-only＋clamp-ACK＋SILENT_DIAG=1＋USB demote(0xA0)
 - 実績：12連続2秒再生＋5分連続(S32/192k)全区間クリーン、hostエラーゼロ
