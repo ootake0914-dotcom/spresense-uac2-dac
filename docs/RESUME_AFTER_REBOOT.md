@@ -122,3 +122,19 @@
   - `partial:0 empty:0`（reserve有効）、enq-deq=16（full cushion・freetop:0）。
   - サーボ正常：水位 122KB→80KB へ単調減少収束（`svd` 加算中・Overrun値は増加停止）。
   - ビットパーフェクト維持：`raw/dst = 0x02017000 / 0xffc7f300`（いずれも下位8bit=0x00＝MSB-alignedのまま）。
+
+## 追記20（2026-09-08 Rev76 Async Feedback挑戦 ＆ open-loop着陸）
+- **規格値の確定**: HS Feedbackは4B LE Q16.16（samples/µframe）。192kHz公称 = 24.0 = `0x00180000`（`00 00 18 00`）。
+  bind時初期値は正しく、TODOコメントの「Fs×2^13／12.13」案は誤り（2倍ずれる）として破棄。FB EPは`bInterval=4`（1ms毎、Linux `f_uac2.c`既定と一致）。
+- **整数PI実装**（`src/uac2_audio_dma.c`）: 1LSB≒1B/s、「1LSB≒1バイト/秒」。P=1/4（τ≒4秒、D項なし）、I＋条件付き積分、
+  出力±8192LSB（±0.52%）、デッドバンド±1KB、水位LPF α=1/16、1ms周期。用途外・停止時は積分器リセット（ワインドアップ防止）。
+- **4段階切分け結果**（`UAC2_FB_HW_ENABLE`）:
+  - Lv0＝記述子のみ：起動するがホストが無応答FBを見限り、一瞬鳴って停止。
+  - Lv1＝＋EP1 `EP_CONFIGURE`（submitなし）：**持続再生OK**。ホストは無言FB EPを許容し公称レートで送り続ける。デバイス側サーボが実働。
+  - Lv2＝＋`EP_SUBMIT`（1kHzペース Garrard 方式でも）：**ボード固結**（UART完全沈黙・無音）。単発submitでも死ぬためISR嵐ではなくDCDのISO
+  IN自体の破綻と断定。`EP_CONFIGURE`は無罪（生存確認済み）。
+- **着陸（Rev76＝Lv1）**: async記述子（data `0x05`＋`bSynchAddress=0x81`、clock source `0x07`→`0x03`、wTotal 138→145B）＋EP1 configure済み＋
+  PIはテレメトリとして live 表示（`[FEED] fb:0x0017e957 ferr:-6820` のように公称へ収束）。実働のドリフト吸収はRev73サーボが継続。
+  submit系コードは `HW_ENABLE>=2` ガードで温存（将来のDCD修正・ZLPプローブ用）。
+- **実機検証**: 持続STREAMING、Buf 95KB→70KBへ収束、partial/empty 0、udr 0、Overrun増加停止、MSB-aligned維持、音OK。
+- **将来課題**: CXD5602 DCDのISO IN転送修正（またはZLP submitプローブ）。閉ループ完成にはDCD側の対応が必須。

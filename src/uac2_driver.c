@@ -44,6 +44,7 @@ typedef struct
   struct usbdev_req_s *ctrlreq;     /* EP0 Control Request */
   struct usbdev_req_s *outreq;      /* EP OUT Isochronous Request */
   struct usbdev_req_s *fbreq;       /* Feedback IN request */
+  volatile bool fb_inflight;        /* Rev76: paced submit guard (ISR clears) */
 
   uint8_t config;                   /* Current configuration value */
   uint8_t alt_setting;              /* AS interface alt: requested (ISR context) */
@@ -172,16 +173,16 @@ static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
 static void uac2_fb_in_complete(struct usbdev_ep_s *ep,
                                 struct usbdev_req_s *req)
 {
-  /* Rev76: feedback IN complete. Resubmit-only here (USB IRQ context:
-   * no computation, no printf). Payload is refreshed by the pump thread
-   * (task context) via uac2_feedback_update().
+  /* Rev76 paced submit: the IN-complete callback (USB IRQ context) only
+   * releases the slot and NEVER resubmits. Resubmission is paced at <=1kHz
+   * from the pump thread (task context) via uac2_feedback_poll(), so even
+   * a hyperactive controller cannot build an ISR resubmit storm.
    * Format (verified): HS Q16.16 LE, samples/microframe.
    * Nominal 192kHz = 24.0 = 0x00180000.
    */
-  if (g_uac2_dev.is_streaming && g_uac2_dev.ep_fb && req == g_uac2_dev.fbreq &&
-      req->result == 0)
+  if (g_uac2_dev.ep_fb && req == g_uac2_dev.fbreq)
     {
-      EP_SUBMIT(ep, req);
+      g_uac2_dev.fb_inflight = false;
     }
 }
 
@@ -198,6 +199,29 @@ void uac2_feedback_update(uint32_t ff_q16)
       g_uac2_dev.fbreq->buf[2] = (uint8_t)(ff_q16 >> 16);
       g_uac2_dev.fbreq->buf[3] = (uint8_t)(ff_q16 >> 24);
     }
+}
+
+/* Rev76: paced feedback submitter (pump thread, task context, <=1kHz).
+ * Submits the 4B Q16.16 payload only when streaming and no transfer is
+ * in flight. The host polls EP1 every 1ms (bInterval=4); a missed poll
+ * simply yields no data that interval (host interpolates).
+ */
+void uac2_feedback_poll(void)
+{
+#if (UAC2_FB_HW_ENABLE >= 2)
+  if (g_uac2_dev.is_streaming && g_uac2_dev.ep_fb && g_uac2_dev.fbreq &&
+      !g_uac2_dev.fb_inflight)
+    {
+      g_uac2_dev.fbreq->len = 4;
+      g_uac2_dev.fb_inflight = true;
+      EP_SUBMIT(g_uac2_dev.ep_fb, g_uac2_dev.fbreq);
+    }
+#else
+  /* Bring-up ladder < 2: never submit (ISO IN submit wedges this DCD).
+   * PI still computes (telemetry only).
+   */
+  (void)0;
+#endif
 }
 
 /* Helpers: endpoint configure descriptors built from static table values */
@@ -255,6 +279,8 @@ static void uac2_resetconfig(Uac2Driver *priv)
     {
       EP_DISABLE(priv->ep_fb);
     }
+
+  priv->fb_inflight = false;
 }
 
 static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
@@ -298,7 +324,7 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
         }
     }
 
-#if !UAC2_SYNC_ADAPTIVE
+#if !UAC2_SYNC_ADAPTIVE && (UAC2_FB_HW_ENABLE >= 1)
   if (priv->ep_fb)
     {
       struct usb_epdesc_s epdesc;
@@ -352,17 +378,11 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       UAC2_TPRINTF("[UAC2] Pre-submitted EP2 OUT request for Alt 0 streaming (len=%u)\n",
              (unsigned)priv->outreq->len);
     }
-#if !UAC2_SYNC_ADAPTIVE
-  /* Rev76 Alt-0 async: arm EP1 IN feedback (configured above).
-   * Submitted once here; the IN-complete callback resubmits while
-   * streaming with the PI-refreshed Q16.16 payload.
+#if !UAC2_SYNC_ADAPTIVE && (UAC2_FB_HW_ENABLE >= 2)
+  /* Rev76 Alt-0 async: NO submit here. The first and all later submits
+   * are paced (<=1kHz) from the pump thread via uac2_feedback_poll(),
+   * which starts flowing within ~2ms of streaming start.
    */
-  if (priv->ep_fb && priv->fbreq)
-    {
-      priv->fbreq->len = 4;
-      EP_SUBMIT(priv->ep_fb, priv->fbreq);
-      UAC2_TPRINTF("[UAC2] EP1 IN feedback armed (nominal 0x00180000)\n");
-    }
 #endif
   uac2_audio_start();
 #endif
@@ -590,6 +610,7 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
   memset(priv->volume, 0, sizeof(priv->volume));
   priv->outreq = NULL;
   priv->fbreq  = NULL;
+  priv->fb_inflight = false;
 
   /* Pre-allocate streaming requests here (task context): allocreq must
    * never run in EP0 setup (USB interrupt) context.

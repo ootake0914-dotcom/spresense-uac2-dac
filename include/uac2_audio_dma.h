@@ -84,6 +84,11 @@ void uac2_audio_get_diag_sample(uint32_t *raw, uint32_t *dst);
  */
 void uac2_feedback_update(uint32_t ff_q16);
 
+/* Rev76: paced feedback submitter (uac2_driver.cが実装。
+ * pumpスレッドが1ms毎に呼ぶ。streaming中かつ送出中でなければ4B送信）
+ */
+void uac2_feedback_poll(void);
+
 /* Legacy wrappers (signatures frozen by uac2_main.c) */
 
 int uac2_audio_dma_init(void);

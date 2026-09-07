@@ -44,6 +44,17 @@
  */
 #define UAC2_SYNC_ADAPTIVE            0
 
+/* Rev76 bring-up ladder for EP1 IN hardware (empirical results):
+ *   0 = descriptors only: host plays briefly, then stops (no feedback).
+ *   1 = + EP_CONFIGURE for EP1 (no submit): SUSTAINED PLAYBACK OK.
+ *       Host tolerates the silent feedback EP; device servo does the work.
+ *       >>> CURRENT LANDING (open loop + live PI telemetry). <<<
+ *   2 = + EP_SUBMIT (paced <=1kHz): BOARD WEDGES (no UART, no sound).
+ *       Even a single ISO IN submit kills this DCD -> DO NOT USE without
+ *       a DCD-level fix. Kept for future work (ZLP probe candidate).
+ */
+#define UAC2_FB_HW_ENABLE             1
+
 /* Rev18 DIAGNOSTIC toggle (revert to 0 after the 2x2 result).
  *   1 = Alt1 is zero-bandwidth (bNumEndpoints=0, no EP descs): tests whether
  *       the SET_INTERFACE stall is gated by EP presence (EP-gating) or by the

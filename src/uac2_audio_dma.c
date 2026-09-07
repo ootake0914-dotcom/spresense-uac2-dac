@@ -395,6 +395,7 @@ static void *uac2_audio_pump_thread(void *arg)
                              &g_fb_pi,
                              uac2_ringbuf_available_read(&g_pcm_ring));
             uac2_feedback_update(g_fb_last_ff);
+            uac2_feedback_poll();
           }
       }
 
