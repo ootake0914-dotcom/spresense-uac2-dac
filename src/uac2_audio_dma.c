@@ -47,7 +47,8 @@ extern bool cxd56_audio_clock_is_enabled(void);
 
 #define UAC2_AUDIO_NUM_BUFFERS      16
 #define UAC2_AUDIO_BUFFER_SIZE      2048   /* 256 frames @ 192kHz stereo 32-bit = 1.33ms */
-/* ポンプスレッドのスタック：chunk[2048]＋割込みネストに備えて余裕を持つ */
+/* ポンプスレッドのスタック：Rev75で中間chunk[2048]は全廃したが、
+ * 割込みネストに備えて8192のまま余裕を持つ（縮小しない） */
 #define UAC2_PUMP_STACKSIZE         8192
 
 /* Slot bitwidth: 24-bit PCM in 32-bit container */
@@ -250,8 +251,9 @@ static void drain_audio_msgs(mqd_t mq)
 static void *uac2_audio_pump_thread(void *arg)
 {
   (void)arg;
-  /* 2KB作業域はstatic化（8KBポンプスタックの溢れ保険） */
-  static uint8_t chunk[UAC2_AUDIO_BUFFER_SIZE];
+  /* Rev75: 中間バッファ chunk[2048] を全廃しリング→APB直読みシングルコピー化。
+   * CPUバススイッチングノイズ・高周波GNDバウンス極小化（ピュアオーディオ対策）。
+   */
 
   printf("[UAC2-AUDIO] Pump thread started (priority 150)\n");
 
@@ -542,13 +544,17 @@ static void *uac2_audio_pump_thread(void *arg)
             {
               g_audio_dma.partial_chunks++;
             }
+          /* Rev75: シングルコピー — リングからAPB (apb->samp) へ直読み。
+           * 中間 chunk[2048] 経由のダブルコピーを廃し、CPUバス転送を半減。
+           */
           if (dup_this)
             {
               /* 直前frame反復を先頭に挿入し、新規消費を2040Bに抑える。
                * APBは2048Bのまま（ペイロード破壊なし・サイズ不変）。
                */
-              memcpy(chunk, g_audio_dma.histframe, 8);
-              uac2_ringbuf_read(&g_pcm_ring, chunk + 8,
+              memcpy(apb->samp, g_audio_dma.histframe, 8);
+              uac2_ringbuf_read(&g_pcm_ring,
+                                (uint8_t *)apb->samp + 8,
                                 UAC2_AUDIO_BUFFER_SIZE - 8);
               g_audio_dma.dupped_frames++;
             }
@@ -556,11 +562,12 @@ static void *uac2_audio_pump_thread(void *arg)
             {
               if (n > 0)
                 {
-                  uac2_ringbuf_read(&g_pcm_ring, chunk, n);
+                  uac2_ringbuf_read(&g_pcm_ring, (uint8_t *)apb->samp, n);
                 }
               if (n < UAC2_AUDIO_BUFFER_SIZE)
                 {
-                  memset(chunk + n, 0, UAC2_AUDIO_BUFFER_SIZE - n);
+                  memset((uint8_t *)apb->samp + n, 0,
+                         UAC2_AUDIO_BUFFER_SIZE - n);
                 }
             }
           /* Rev74: True Bit-Perfect 24-bit MSB-Aligned Direct Transfer.
@@ -571,39 +578,24 @@ static void *uac2_audio_pump_thread(void *arg)
            * MSB-aligned format.
            * Therefore, host data is passed directly with 100% bit-perfect fidelity,
            * eliminating false 8-bit left shifts (+48dB excessive gain & wrap-around distortion).
+           * (Rev75: chunk経由memcpyは廃止。上記直読みがそのまま該当する)
            */
-          memcpy(apb->samp, chunk, UAC2_AUDIO_BUFFER_SIZE);
           {
-            const uint32_t *src32 = (const uint32_t *)chunk;
+            const uint32_t *src32 = (const uint32_t *)apb->samp;
             if (src32[0] != 0u)
               {
                 g_diag_raw_sample = src32[0];
                 g_diag_dst_sample = src32[0];
               }
           }
-          memcpy(g_audio_dma.histframe, chunk + UAC2_AUDIO_BUFFER_SIZE - 8, 8);
+          /* ヒストリ更新（dup用直前フレーム保持） */
+          memcpy(g_audio_dma.histframe,
+                 (const uint8_t *)apb->samp + UAC2_AUDIO_BUFFER_SIZE - 8, 8);
 
-          /* 一時診断：チャンク内の実データ有無を監査する */
-          {
-            const uint32_t *w = (const uint32_t *)apb->samp;
-            uint32_t nonzero = 0;
-            for (uint32_t i = 0; i < UAC2_AUDIO_BUFFER_SIZE / 4; i += 4)
-              {
-                if (w[i] != 0u)
-                  {
-                    nonzero = 1;
-                    break;
-                  }
-              }
-            if (nonzero)
-              {
-                g_audio_dma.data_chunks++;
-              }
-            else
-              {
-                g_audio_dma.silent_chunks++;
-              }
-          }
+          /* Rev75: 毎バッファ舐めていた非ゼロ監査ループ
+           * (data_chunks/silent_chunks) はバス負荷となるためバイパス。
+           * カウンタ/APIは互換維持のため残すが、ここでは加算しない。
+           */
           apb->nbytes = UAC2_AUDIO_BUFFER_SIZE;
           apb->curbyte = 0;
 
