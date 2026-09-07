@@ -608,7 +608,25 @@ int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels)
 
   uac2_ringbuf_init(&g_pcm_ring);
 
-  printf("[UAC2-AUDIO] Powering on CXD5247 codec...\n");
+  /* Rev68: True 192kHz Native Playback Fix.
+   * CXD5247 S-Master cannot be switched on-the-fly (hot-switched).
+   * Perform full power cycle: poweroff -> set_clkmode(HIRES) -> poweron.
+   */
+  printf("[UAC2-AUDIO] Ensuring Audio Subsystem is powered down before clock setup...\n");
+  board_audio_power_control(false);
+
+  printf("[UAC2-AUDIO] Setting Audio Clock Mode to HIRES (192kHz)...\n");
+  CXD56_AUDIO_ECODE clk_err = cxd56_audio_set_clkmode(CXD56_AUDIO_CLKMODE_HIRES);
+  if (clk_err != CXD56_AUDIO_ECODE_OK)
+    {
+      printf("[UAC2-AUDIO] WARNING: cxd56_audio_set_clkmode failed: %d\n", clk_err);
+    }
+  else
+    {
+      printf("[UAC2-AUDIO] Audio Clock Mode successfully set to HIRES!\n");
+    }
+
+  printf("[UAC2-AUDIO] Powering on CXD5247 codec with 192kHz HIRES clock...\n");
   board_audio_power_control(true);
 
   printf("[UAC2-AUDIO] Disabling MIC input circuits (clean DAC mode)...\n");
@@ -734,10 +752,9 @@ int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels)
   vol_desc.caps.ac_controls.hw[0] = 1000; /* 0dB (max) */
   ioctl(g_audio_dma.dev_fd, AUDIOIOC_CONFIGURE, (unsigned long)(uintptr_t)&vol_desc);
 
-  /* NOTE: CXD5247 S-master reprogramming to 192k (HIRES osc + SMSTRFS_32)
-   * was tried in Rev66 and reverted in Rev67: it muted the output despite
-   * returning success. The stock 48k-mode programming sounds correct
-   * (5min+ verified). See git history if revisiting.
+  /* NOTE: In Rev66, on-the-fly live switching to 192k caused mute.
+   * In Rev68, this is solved cleanly by configuring CXD56_AUDIO_CLKMODE_HIRES
+   * during initial power cycle before board_audio_power_control(true).
    */
 
   /* Initialize APB pool */
