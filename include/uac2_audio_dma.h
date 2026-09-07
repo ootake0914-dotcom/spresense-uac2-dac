@@ -73,6 +73,9 @@ void uac2_audio_get_msg_stats(uint32_t *msg_underrun, uint32_t *msg_ioerror);
 /* オーディオクロックの有効状態（エンジン不動時の切り分け用） */
 bool uac2_audio_clock_state(void);
 
+/* 一時診断用：直近サンプルの生値（raw / dst）取得 */
+void uac2_audio_get_diag_sample(uint32_t *raw, uint32_t *dst);
+
 /* Legacy wrappers (signatures frozen by uac2_main.c) */
 
 int uac2_audio_dma_init(void);

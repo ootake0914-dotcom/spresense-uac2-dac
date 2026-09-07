@@ -45,7 +45,11 @@ static inline uint32_t uac2_ringbuf_write(Uac2RingBuffer *rb, const uint8_t *dat
     uint32_t avail = uac2_ringbuf_available_write(rb);
     if (len > avail) {
         rb->overrun_count++;
-        len = avail;
+        /* CRITICAL: Align to 8-byte stereo frame boundary.
+         * Writing a partial frame destroys PCM byte-alignment forever,
+         * turning all subsequent audio into harsh noise until stream restart.
+         */
+        len = avail & ~7u;
     }
     if (len == 0) return 0;
 
@@ -68,8 +72,9 @@ static inline uint32_t uac2_ringbuf_read(Uac2RingBuffer *rb, uint8_t *dest, uint
     if (len > avail) {
         rb->underrun_count++;
         /* Fill remainder with zero (silence) */
-        memset(dest + avail, 0, len - avail);
-        len = avail;
+        uint32_t aligned_avail = avail & ~7u;
+        memset(dest + aligned_avail, 0, len - aligned_avail);
+        len = aligned_avail;
     }
     if (len == 0) return 0;
 

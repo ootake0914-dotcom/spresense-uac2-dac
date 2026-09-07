@@ -120,6 +120,8 @@ struct uac2_audio_dma_s
 
 static struct uac2_audio_dma_s g_audio_dma;
 static Uac2RingBuffer g_pcm_ring;
+static volatile uint32_t g_diag_raw_sample = 0;
+static volatile uint32_t g_diag_dst_sample = 0;
 
 static void free_pool_push(struct ap_buffer_s *apb)
 {
@@ -462,20 +464,43 @@ static void *uac2_audio_pump_thread(void *arg)
             }
 
           uint32_t avail = uac2_ringbuf_available_read(&g_pcm_ring);
-          /* クロックドリフトサーボ（dead-band式）：ホストとエンジンの
-           * 数十ppm差で水位が∼20分で壁に到達し慢性破綻する。
-           * HIGH(192K)超で1frame/8wakeを捨て、LOW(2APB未満からの
-           * フルtake時)で1frame/8takeを直前frame反復で嵩増しする。
-           * どちらも±0.05%・単発frameで不可聴。水位を有界に保つ。
+          /* Rev73: Multi-tier Proportional Clock Drift Servo.
+           * Total capacity is 128KB (~85ms). Target level is ~64KB (~42ms).
+           * Deadband: 32KB - 64KB (pure bit-perfect, zero intervention).
+           * High levels trigger proportional frame dropping (8 bytes/frame)
+           * to strictly prevent buffer from ever reaching 128KB wall (Overrun).
            */
-          if (avail > 96u * 1024u)
+          if (avail > 64u * 1024u)
             {
-              static uint8_t drop8[8];
               g_audio_dma.servo_tick++;
-              if ((g_audio_dma.servo_tick & 7u) == 0)
+              int drop_frames = 0;
+              if (avail > 112u * 1024u)
                 {
-                  uac2_ringbuf_read(&g_pcm_ring, drop8, 8);
-                  g_audio_dma.dropped_frames++;
+                  /* Critical zone: drop 2 frames every wake (~128KB/s drain) */
+                  drop_frames = 2;
+                }
+              else if (avail > 96u * 1024u)
+                {
+                  /* High danger: drop 1 frame every wake (~64KB/s drain) */
+                  drop_frames = 1;
+                }
+              else if (avail > 80u * 1024u)
+                {
+                  /* Alert zone: drop 1 frame every 2 wakes (~32KB/s drain) */
+                  if ((g_audio_dma.servo_tick & 1u) == 0) drop_frames = 1;
+                }
+              else
+                {
+                  /* Slight drift: drop 1 frame every 8 wakes (~8KB/s drain) */
+                  if ((g_audio_dma.servo_tick & 7u) == 0) drop_frames = 1;
+                }
+
+              if (drop_frames > 0)
+                {
+                  uint8_t drop_buf[16];
+                  uint32_t bytes_to_drop = (uint32_t)drop_frames * 8u;
+                  uac2_ringbuf_read(&g_pcm_ring, drop_buf, bytes_to_drop);
+                  g_audio_dma.dropped_frames += drop_frames;
                   avail = uac2_ringbuf_available_read(&g_pcm_ring);
                 }
             }
@@ -538,12 +563,15 @@ static void *uac2_audio_pump_thread(void *arg)
                   memset(chunk + n, 0, UAC2_AUDIO_BUFFER_SIZE - n);
                 }
             }
-          /* Rev71: True Peak Protection & 24-bit MSB-Alignment.
-           * 1) Sign-extend LSB-aligned 24-bit sample from bit 23 into 32-bit signed integer.
-           * 2) Apply -3.0dB digital headroom (s * 181 >> 8) to prevent S-Master PWM modulator
-           *    from saturating/over-modulating on high-loudness tracks (J-POP Loudness War,
-           *    inter-sample True Peaks reaching +1.0 ~ +2.5 dBFS).
-           * 3) Shift left 8 bits to place into CXD5602/CXD5247 MSB-aligned DAC container.
+          /* Rev72: S-Master Delta-Sigma Modulator Stability & Anti-Latchup Fix.
+           * S-Master (CXD5247) uses a high-order Delta-Sigma PWM modulator.
+           * At inputs near 0dBFS (especially heavily-mastered J-POP with True Peaks),
+           * the integrator enters limit-cycle oscillation (modulator latch-up).
+           * Once latched, it produces continuous square-wave hash/buzzing until input
+           * is cut below ~50%.
+           * Applying a clean 1-bit attenuation (-6.02 dBFS, via `s << 7`) ensures
+           * the modulator never crosses its instability boundary, eliminating latch-up
+           * permanently while preserving full bit-perfect resolution and zero CPU overhead.
            */
           {
             const uint32_t *src32 = (const uint32_t *)chunk;
@@ -551,8 +579,12 @@ static void *uac2_audio_pump_thread(void *arg)
             for (uint32_t i = 0; i < UAC2_AUDIO_BUFFER_SIZE / 4; i++)
               {
                 int32_t s = (int32_t)(src32[i] << 8) >> 8;
-                s = (s * 181) >> 8; /* -3.01 dB True Peak protection */
-                dst32[i] = (uint32_t)(s << 8);
+                dst32[i] = (uint32_t)(s << 7); /* -6.02 dB S-Master stability headroom */
+              }
+            if (src32[0] != 0u)
+              {
+                g_diag_raw_sample = src32[0];
+                g_diag_dst_sample = dst32[0];
               }
           }
           memcpy(g_audio_dma.histframe, chunk + UAC2_AUDIO_BUFFER_SIZE - 8, 8);
@@ -1024,6 +1056,12 @@ void uac2_audio_get_msg_stats(uint32_t *msg_underrun, uint32_t *msg_ioerror)
 bool uac2_audio_clock_state(void)
 {
   return cxd56_audio_clock_is_enabled();
+}
+
+void uac2_audio_get_diag_sample(uint32_t *raw, uint32_t *dst)
+{
+  if (raw) *raw = g_diag_raw_sample;
+  if (dst) *dst = g_diag_dst_sample;
 }
 
 /* Legacy entry points */

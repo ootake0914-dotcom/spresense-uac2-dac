@@ -189,10 +189,12 @@ int main(int argc, char *argv[])
               uac2_audio_get_data_stats(&dc, &sc);
               uint32_t mu = 0, me = 0;
               uac2_audio_get_msg_stats(&mu, &me);
-              printf("[DAT #%lu] data_chunks:%lu silent_chunks:%lu msg_udr:%lu msg_err:%lu\n",
+              uint32_t r_smp = 0, d_smp = 0;
+              uac2_audio_get_diag_sample(&r_smp, &d_smp);
+              printf("[DAT #%lu] dc:%lu sc:%lu raw:0x%08lx dst:0x%08lx\n",
                      (unsigned long)(tick_100ms / 10),
                      (unsigned long)dc, (unsigned long)sc,
-                     (unsigned long)mu, (unsigned long)me);
+                     (unsigned long)r_smp, (unsigned long)d_smp);
             }
             fflush(stdout);
         }
