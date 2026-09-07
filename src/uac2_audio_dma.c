@@ -538,7 +538,19 @@ static void *uac2_audio_pump_thread(void *arg)
                   memset(chunk + n, 0, UAC2_AUDIO_BUFFER_SIZE - n);
                 }
             }
-          memcpy(apb->samp, chunk, UAC2_AUDIO_BUFFER_SIZE);
+          /* Rev69: 24-bit Alignment Fix.
+           * Linux sends LSB-aligned 24-bit in 32-bit slot (0x00XXXXXX).
+           * CXD5602/CXD5247 hardware DAC expects MSB-aligned (0xXXXXXX00).
+           * Shift left by 8 bits to restore sign bit and full 24-bit dynamic range.
+           */
+          {
+            const uint32_t *src32 = (const uint32_t *)chunk;
+            uint32_t *dst32 = (uint32_t *)apb->samp;
+            for (uint32_t i = 0; i < UAC2_AUDIO_BUFFER_SIZE / 4; i++)
+              {
+                dst32[i] = src32[i] << 8;
+              }
+          }
           memcpy(g_audio_dma.histframe, chunk + UAC2_AUDIO_BUFFER_SIZE - 8, 8);
 
           /* 一時診断：チャンク内の実データ有無を監査する */

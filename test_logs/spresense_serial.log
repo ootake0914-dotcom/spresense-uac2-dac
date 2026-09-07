@@ -1,24 +1,6 @@
-[UAC2 #8] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[UAC2 #9] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[REG] CFG=0x0002002c CTL=0x0000020c STS=0xed5c0011 INT=0x00000000 BUSY=0x00000000 | EP2CTL=0x00000050 EP2STS=0x00000100
-[UAC2] SET_IF if=1 alt=0 via=SI-synth
-[UAC2] SET_INTERFACE if=1 alt=0 | CFG=0x0002002c CTL=0x0000020c STS=0x58d00011 | EP2CTL=0x00000050
-[UAC2] SET_IF -> 0
-[EP0] type=0x01 req=0x0b val=0x0000(cs=0,ch=0) idx=0x0001(ent=0,if=1) len=0 -> ret=0
-[UAC2 #10] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[UAC2 #11] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[UAC2 #12] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[REG] CFG=0x0002002c CTL=0x0000020c STS=0x695c0011 INT=0x00000000 BUSY=0x00000000 | EP2CTL=0x00000050 EP2STS=0x00000100
-[UAC2] SET_IF if=1 alt=0 via=SI-synth
-[UAC2] SET_INTERFACE if=1 alt=0 | CFG=0x0002002c CTL=0x0000020c STS=0xd1c40011 | EP2CTL=0x00000050
-[UAC2] SET_IF -> 0
-[EP0] type=0x01 req=0x0b val=0x0000(cs=0,ch=0) idx=0x0001(ent=0,if=1) len=0 -> ret=0
-[UAC2 #13] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[UAC2 #14] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[UAC2 #15] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[REG] CFG=0x0002002c CTL=0x0000020c STS=0xe55c0011 INT=0x00000000 BUSY=0x00000000 | EP2CTL=0x00000050 EP2STS=0x00000100
-[UAC2 #16] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[UAC2 #17] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[UAC2 #18] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
-[REG] CFG=0x0002002c CTL=0x0000020c STS=0x601c0011 INT=0x00000000 BUSY=0x00000000 | EP2CTL=0x00000050 EP2STS=0x00000100
-[UAC2 #19] STANDBY (Waiting Host Playback) | Alt:0 | SR:192000 Hz | Buf:0 B | Under:0 | Over:0
+[PUMP] wakes=788362 enq=73925 deq=73909 freetop=0 sem=0 avail=95935
+[SMP-DUMP] 0xff590400 0xff591500 0xff639600 0xff499900
+[PUMP] wakes=796361 enq=74675 deq=74659 freetop=0 sem=0 avail=95743
+[SMP-DUMP] 0xfb4f9000 0xfa2b4d00 0xfb18b600 0xfa11a300
+[PUMP] wakes=804361 enq=75425 deq=75409 freetop=0 sem=0 avail=95743
+[SMP-DUMP] 0x03e07c00 0x01a73b00 0x03d3a700 0x01907000

@@ -77,3 +77,14 @@
 - 水晶再計算：49.152MHz系で192kは整数分周exact、誤差<140ppm（soak bound）。粗い誤差なし
 - 実績：YouTube連続再生ずっと正常（10秒崩壊も解消）。aplay 1kHz正常
 - 残件（無害・将来用）：SDK cxd56_audio_set_hires_outputは残置未使用、diag_drain/diag_tickは未使用、refill再採番で偽dup計数が出ることがある（表示のみ）
+
+## 追記14（2026-09-07 Rev68 192kHzネイティブ化 ＆ Rev69 24-bit PCMアライメント修正完了）
+- **Rev68（真の192kHzネイティブDAC再生）**:
+  - CXD5247（S-Master）は通電・稼働中のホットスイッチによるクロック変更で無音保護（Mute）に入っていたことが判明。
+  - 初期化シーケンスを `board_audio_power_control(false)` ➔ `cxd56_audio_set_clkmode(CXD56_AUDIO_CLKMODE_HIRES)` ➔ `board_audio_power_control(true)` に変更し、DACハードウェアを 192kHz ネイティブでクリーン起動。
+- **Rev69（24-bit PCM MSBアライメント修正 ＆ ノイズ根絶）**:
+  - 現象：デジタル再生時に「ホワイトノイズ」「ファミコンのような音（ビットクラッシュ歪み）」が発生。
+  - 原因：Linux（PipeWire/ALSA）は 32-bit コンテナの下位24ビット（LSB-aligned: bits 0-23）で転送していたが、CXD5602/CXD5247 DAC は上位24ビット（MSB-aligned: bits 8-31）を音声データとして解釈していた。そのため符号ビット（bit 31）が常に 0 と見なされ、負の波形が巨大な正の値に反転クリップしていた。
+  - 対策：ポンプスレッドにて `dst32[i] = src32[i] << 8;` を適用。符号ビットと 24-bit ダイナミックレンジを完全復元。
+  - ポンプスレッド内のUART同期出力を全廃し、ジッター・ジリノイズのないクリアな高音質ハイレゾ再生を実機（COM6）で確認。
+
