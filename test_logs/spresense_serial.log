@@ -1,7 +1,3 @@
-[UAC2-AUDIO] NVIC IRQ 103 prio restored 0x80, readback 0x80
-[UAC2-AUDIO] NVIC IRQ 104 prio restored 0x80, readback 0x80
-[UAC2-AUDIO] NVIC IRQ 116 (USB) demoted 0xa0, readback 0xa0
-[UAC2-AUDIO] NVIC IRQ 117 (USB) demoted 0xa0, readback 0xa0
 [UAC2-AUDIO] Opened /dev/audio/pcm0 fd=3
 [UAC2-AUDIO] Pump thread started (priority 150)
 [PUMP] wakes=1 enq=16 deq=0 freetop=0 sem=1 avail=131071
@@ -59,5 +55,6 @@
 [EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
 [EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
 [EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
-[PUMP] wakes=4695 enq=455 deq=439 freetop=0 sem=0 avail=129447
-[PUMP] wakes=12695 enq=1205 deq=1189 freetop=0 sem=0 avail=128695
+[PUMP] wakes=3289 enq=323 deq=307 freetop=0 sem=0 avail=129815
+[PUMP] wakes=11288 enq=1073 deq=1057 freetop=0 sem=0 avail=128871
+[PUMP] wakes=19288 enq=1823 deq=1807 freetop=0 sem=0 avail=128127

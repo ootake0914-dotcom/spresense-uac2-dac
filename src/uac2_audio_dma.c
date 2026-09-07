@@ -538,17 +538,21 @@ static void *uac2_audio_pump_thread(void *arg)
                   memset(chunk + n, 0, UAC2_AUDIO_BUFFER_SIZE - n);
                 }
             }
-          /* Rev69: 24-bit Alignment Fix.
-           * Linux sends LSB-aligned 24-bit in 32-bit slot (0x00XXXXXX).
-           * CXD5602/CXD5247 hardware DAC expects MSB-aligned (0xXXXXXX00).
-           * Shift left by 8 bits to restore sign bit and full 24-bit dynamic range.
+          /* Rev71: True Peak Protection & 24-bit MSB-Alignment.
+           * 1) Sign-extend LSB-aligned 24-bit sample from bit 23 into 32-bit signed integer.
+           * 2) Apply -3.0dB digital headroom (s * 181 >> 8) to prevent S-Master PWM modulator
+           *    from saturating/over-modulating on high-loudness tracks (J-POP Loudness War,
+           *    inter-sample True Peaks reaching +1.0 ~ +2.5 dBFS).
+           * 3) Shift left 8 bits to place into CXD5602/CXD5247 MSB-aligned DAC container.
            */
           {
             const uint32_t *src32 = (const uint32_t *)chunk;
             uint32_t *dst32 = (uint32_t *)apb->samp;
             for (uint32_t i = 0; i < UAC2_AUDIO_BUFFER_SIZE / 4; i++)
               {
-                dst32[i] = src32[i] << 8;
+                int32_t s = (int32_t)(src32[i] << 8) >> 8;
+                s = (s * 181) >> 8; /* -3.01 dB True Peak protection */
+                dst32[i] = (uint32_t)(s << 8);
               }
           }
           memcpy(g_audio_dma.histframe, chunk + UAC2_AUDIO_BUFFER_SIZE - 8, 8);
@@ -755,17 +759,13 @@ int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels)
       printf("[UAC2-AUDIO] WARNING: AUDIOIOC_CONFIGURE returned %d\n", ret);
     }
 
-  /* Set initial volume with -1.5dB safety headroom for S-Master (850 / 1000).
-   * High-loudness sources (J-POP Loudness War tracks, ISP > 0dBFS) cause
-   * S-Master PWM modulator to saturate/over-modulate at 1000 (0dB max).
-   * 850 (~-1.5dB) provides essential True Peak headroom.
-   */
+  /* Set initial volume (100% / 0dB) - digital headroom is handled in pump thread */
   struct audio_caps_desc_s vol_desc;
   memset(&vol_desc, 0, sizeof(vol_desc));
   vol_desc.caps.ac_len = sizeof(struct audio_caps_s);
   vol_desc.caps.ac_type = AUDIO_TYPE_FEATURE;
   vol_desc.caps.ac_format.hw = AUDIO_FU_VOLUME;
-  vol_desc.caps.ac_controls.hw[0] = 850; /* -1.5dB ISP headroom */
+  vol_desc.caps.ac_controls.hw[0] = 1000; /* 0dB (max) */
   ioctl(g_audio_dma.dev_fd, AUDIOIOC_CONFIGURE, (unsigned long)(uintptr_t)&vol_desc);
 
   /* NOTE: In Rev66, on-the-fly live switching to 192k caused mute.
@@ -931,8 +931,7 @@ void uac2_audio_set_volume(uint8_t volume_percent)
 
   if (g_audio_dma.dev_fd >= 0)
     {
-      /* Scale 0..100% to 0..850 (-1.5dB headroom at max) to protect S-Master */
-      uint16_t gain = (uint16_t)((uint32_t)volume_percent * 850u / 100u);
+      uint16_t gain = (uint16_t)((uint32_t)volume_percent * 10u);
       struct audio_caps_desc_s desc;
       memset(&desc, 0, sizeof(desc));
       desc.caps.ac_len = sizeof(struct audio_caps_s);
