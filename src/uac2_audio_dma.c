@@ -132,7 +132,7 @@ static volatile uint32_t g_diag_dst_sample = 0;
  */
 #define UAC2_FB_NOMINAL_Q16  (24u << 16)   /* 192kHz: 24.0 samples/uframe */
 #define UAC2_FB_TARGET_B     (64u * 1024u) /* ring target level (bytes) */
-#define UAC2_FB_DEADBAND_B   1024          /* +/-1KB: pure bit-perfect zone */
+#define UAC2_FB_DEADBAND_B   1024          /* +/-1KB: zero intervention zone */
 #define UAC2_FB_CLAMP_LSB    8192          /* +/-0.125/uframe (+/-0.52%) */
 #define UAC2_FB_I_MAX        (4096L * 32768L)
 
@@ -552,7 +552,7 @@ static void *uac2_audio_pump_thread(void *arg)
           uint32_t avail = uac2_ringbuf_available_read(&g_pcm_ring);
           /* Rev73: Multi-tier Proportional Clock Drift Servo.
            * Total capacity is 128KB (~85ms). Target level is ~64KB (~42ms).
-           * Deadband: 32KB - 64KB (pure bit-perfect, zero intervention).
+           * Deadband: 32KB - 64KB (zero intervention, pure passthrough).
            * High levels trigger proportional frame dropping (8 bytes/frame)
            * to strictly prevent buffer from ever reaching 128KB wall (Overrun).
            */
@@ -654,13 +654,13 @@ static void *uac2_audio_pump_thread(void *arg)
                          UAC2_AUDIO_BUFFER_SIZE - n);
                 }
             }
-          /* Rev74: True Bit-Perfect 24-bit MSB-Aligned Direct Transfer.
+          /* Rev74: True Direct 24-bit MSB-Aligned Passthrough.
            * USB Audio 2.0 specification (Type I Formats) defines that 24-bit PCM
            * in 4-byte subslots is inherently MSB-aligned (left-justified: bits 8-31
            * contain audio data, bits 0-7 are zero-padding).
            * CXD5602/CXD5247 hardware DAC in 32-bit slot mode expects this exact
            * MSB-aligned format.
-           * Therefore, host data is passed directly with 100% bit-perfect fidelity,
+           * Therefore, host data is passed directly without software scaling or DSP,
            * eliminating false 8-bit left shifts (+48dB excessive gain & wrap-around distortion).
            * (Rev75: chunk経由memcpyは廃止。上記直読みがそのまま該当する)
            */

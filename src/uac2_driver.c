@@ -546,11 +546,17 @@ void uac2_driver_poll(void)
       uac2_build_fb_in_desc(&epdesc);
       EP_CONFIGURE(priv->ep_fb, &epdesc, true);
 
+#if (UAC2_FB_HW_ENABLE >= 2)
+      /* Rev76 lesson (see uac2_desc.h ladder): a single EP_SUBMIT on the
+       * ISO IN feedback EP wedges this DCD (no UART, no sound). Never
+       * submit below HW_ENABLE>=2, even on this legacy multi-alt path.
+       */
       if (priv->fbreq)
         {
           priv->fbreq->len = 4;
           EP_SUBMIT(priv->ep_fb, priv->fbreq);
         }
+#endif
     }
 
   uac2_audio_start();
