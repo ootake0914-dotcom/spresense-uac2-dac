@@ -12,6 +12,16 @@ DOTCONFIG=$NUTTX/.config
 APP_LINK=$SDK/apps/examples/uac2_dac
 APP_SRC="$(cd "$(dirname "$0")" && pwd)"
 
+# Board serial port: explicit arg or UAC2_FLASH_PORT (fail fast, before build)
+PORT="${1:-${UAC2_FLASH_PORT:-}}"
+if [ -z "$PORT" ]; then
+    echo "[ERROR] No serial port given. Usage: $0 <serial-port>"
+    echo "  Windows: Device Manager -> Ports (COM & LPT)"
+    echo "  Linux:   ls /dev/ttyUSB*"
+    echo "  Or set the UAC2_FLASH_PORT environment variable."
+    exit 1
+fi
+
 # 1. Ensure symlink apps/examples/uac2_dac -> spresense_uac2_dac
 if [ ! -e "$APP_LINK" ]; then
     echo "[LINK] Creating symlink $APP_LINK -> $APP_SRC"
@@ -109,8 +119,7 @@ fi
 # the NuttX apps build drops into src/ — filenames embed the absolute path.
 rm -f "$APP_SRC"/src/*.o
 
-# 4. Flash (WSL: pass Windows COM port through; Linux: /dev/ttyUSB0)
-PORT="${1:-COM6}"
+# 4. Flash (port validated at startup)
 echo "[FLASH] Flashing to Spresense on $PORT..."
 ./tools/flash.sh -c "$PORT" -b 115200 nuttx.spk
 

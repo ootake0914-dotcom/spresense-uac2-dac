@@ -1,3 +1,4 @@
+import os
 import serial
 import sys
 import time
@@ -5,11 +6,13 @@ import time
 def main():
     duration = float(sys.argv[1]) if len(sys.argv) > 1 else 15.0
     outfile = sys.argv[2] if len(sys.argv) > 2 else "test_logs/spresense_serial.log"
+    # UAC2_SERIAL_PORT overrides the default (e.g. /dev/ttyUSB0 on Linux).
+    port = os.environ.get('UAC2_SERIAL_PORT', 'COM6')
 
-    print(f"[SERIAL] Opening COM6 (passive mode). Recording to {outfile} for {duration}s...", flush=True)
+    print(f"[SERIAL] Opening {port} (passive mode). Recording to {outfile} for {duration}s...", flush=True)
     try:
         ser = serial.Serial()
-        ser.port = 'COM6'
+        ser.port = port
         ser.baudrate = 115200
         ser.timeout = 0.2
         ser.dtr = False

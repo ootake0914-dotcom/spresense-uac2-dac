@@ -169,7 +169,9 @@ export SPRESENSE=/path/to/spresense
 export SPRESENSE_TOOLS=/path/to/spresense-tools
 export UAC2_TEST_HOST="user@linux-host"   # for tools/run_*.sh remote tests
 
-./build_and_flash.sh COM6   # e.g. /dev/ttyUSB0 on Linux
+./build_and_flash.sh <serial-port>   # or set UAC2_FLASH_PORT
+# Windows: Device Manager -> Ports (COM & LPT)
+# Linux:   ls /dev/ttyUSB*  (e.g. /dev/ttyUSB0)
 ```
 
 `nuttx.spk` is generated under `sdk/` and flashed by the same script.
