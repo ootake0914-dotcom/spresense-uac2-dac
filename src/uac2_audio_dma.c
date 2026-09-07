@@ -124,6 +124,62 @@ static Uac2RingBuffer g_pcm_ring;
 static volatile uint32_t g_diag_raw_sample = 0;
 static volatile uint32_t g_diag_dst_sample = 0;
 
+/* Rev76: async-feedback PI controller state (integer-only, 1ms cadence).
+ * Plant: host byte rate = F * 64000 B/s (F in samples/uframe), so
+ * 1 LSB of Q16.16 F ~= 0.977 B/s of correction ("1LSB ~= 1 byte/sec").
+ * P gain 0.25 LSB/byte -> tau ~= 4 s (host delay is ms-scale: no hunting).
+ * No D term (same reason). I absorbs crystal offset with anti-windup.
+ */
+#define UAC2_FB_NOMINAL_Q16  (24u << 16)   /* 192kHz: 24.0 samples/uframe */
+#define UAC2_FB_TARGET_B     (64u * 1024u) /* ring target level (bytes) */
+#define UAC2_FB_DEADBAND_B   1024          /* +/-1KB: pure bit-perfect zone */
+#define UAC2_FB_CLAMP_LSB    8192          /* +/-0.125/uframe (+/-0.52%) */
+#define UAC2_FB_I_MAX        (4096L * 32768L)
+
+struct uac2_fb_pi_s
+{
+  int32_t lvl_filt;  /* low-passed ring level, bytes */
+  int32_t istate;    /* integral accumulator, byte*ms */
+};
+
+static struct uac2_fb_pi_s g_fb_pi;
+static uint32_t g_fb_last_ff = UAC2_FB_NOMINAL_Q16;
+static int32_t g_fb_last_err = 0;
+
+static uint32_t uac2_fb_pi_update(struct uac2_fb_pi_s *pi, uint32_t level_b)
+{
+  /* 1ms low-pass (absorbs +/-4KB reserve steps so feedback never chatters) */
+  pi->lvl_filt += ((int32_t)level_b - pi->lvl_filt) / 16;
+
+  int32_t e = (int32_t)UAC2_FB_TARGET_B - pi->lvl_filt;
+  if (e > -UAC2_FB_DEADBAND_B && e < UAC2_FB_DEADBAND_B)
+    {
+      e = 0;
+    }
+  g_fb_last_err = e;
+
+  int32_t p = e / 4; /* P: tau ~= 4 s */
+  int32_t hi = (int32_t)UAC2_FB_NOMINAL_Q16 + UAC2_FB_CLAMP_LSB;
+  int32_t lo = (int32_t)UAC2_FB_NOMINAL_Q16 - UAC2_FB_CLAMP_LSB;
+  int32_t out_ol = (int32_t)UAC2_FB_NOMINAL_Q16 + p + pi->istate / 32768;
+
+  /* Conditional integration (anti-windup): freeze the integrator only
+   * when the output is already saturated AND the error pushes further
+   * into the same saturation (e>0 drives up, e<0 drives down).
+   */
+  if (!((out_ol >= hi && e > 0) || (out_ol <= lo && e < 0)))
+    {
+      pi->istate += e; /* per 1ms tick */
+      if (pi->istate >  UAC2_FB_I_MAX) pi->istate =  UAC2_FB_I_MAX;
+      if (pi->istate < -UAC2_FB_I_MAX) pi->istate = -UAC2_FB_I_MAX;
+    }
+
+  int32_t out = (int32_t)UAC2_FB_NOMINAL_Q16 + p + pi->istate / 32768;
+  if (out > hi) out = hi;
+  if (out < lo) out = lo;
+  return (uint32_t)out;
+}
+
 static void free_pool_push(struct ap_buffer_s *apb)
 {
   if (g_audio_dma.free_top >= UAC2_AUDIO_NUM_BUFFERS)
@@ -312,8 +368,35 @@ static void *uac2_audio_pump_thread(void *arg)
 
       if (!g_audio_dma.is_playing || g_audio_dma.dev_fd < 0)
         {
+          /* Idle: reset the feedback loop and hold nominal so no
+           * windup accumulates while the ring sits empty.
+           */
+          g_fb_pi.lvl_filt = 0;
+          g_fb_pi.istate = 0;
+          g_fb_last_err = 0;
+          g_fb_last_ff = UAC2_FB_NOMINAL_Q16;
+          uac2_feedback_update(UAC2_FB_NOMINAL_Q16);
           continue;
         }
+
+      /* Rev76: async-feedback PI @1ms cadence (task context).
+       * Refreshes the EP1 IN payload the host polls every 1ms.
+       */
+      {
+        static struct timespec fb_last = {0, 0};
+        struct timespec fb_now;
+        clock_gettime(CLOCK_REALTIME, &fb_now);
+        long fb_dms = (fb_now.tv_sec - fb_last.tv_sec) * 1000L +
+                      (fb_now.tv_nsec - fb_last.tv_nsec) / 1000000L;
+        if (fb_dms >= 1)
+          {
+            fb_last = fb_now;
+            g_fb_last_ff = uac2_fb_pi_update(
+                             &g_fb_pi,
+                             uac2_ringbuf_available_read(&g_pcm_ring));
+            uac2_feedback_update(g_fb_last_ff);
+          }
+      }
 
       /* ストリーム開始検出：50ms gap（25wake）後の初到着で残渣snap */
       {
@@ -1029,6 +1112,13 @@ void uac2_audio_get_servo_stats(uint32_t *dropped, uint32_t *dupped)
 {
   if (dropped) *dropped = g_audio_dma.dropped_frames;
   if (dupped)  *dupped  = g_audio_dma.dupped_frames;
+}
+
+/* Rev76: async-feedback PI統計の取得（表示用） */
+void uac2_audio_get_fb_stats(uint32_t *ff_q16, int32_t *err_b)
+{
+  if (ff_q16) *ff_q16 = g_fb_last_ff;
+  if (err_b)  *err_b  = g_fb_last_err;
 }
 
 /* 一時診断：ドライバ通知メッセージ到着カウンタの取得 */

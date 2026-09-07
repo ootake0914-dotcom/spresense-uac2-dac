@@ -34,15 +34,15 @@
 #define UAC2_CONFIG_NCONFIGS          0x01
 #define UAC2_MXDESCLEN                256
 
-/* Sync type diagnostic toggle (flip to 1 + rebuild + reflash for the test).
- *   0 = Asynchronous OUT + Feedback IN (product goal, Phase 4).
- *   1 = Adaptive OUT, no Feedback EP (diagnostic: removes the entire
- *       feedback subsystem from enumeration to isolate pin-creation
- *       failures. Host paces packets; ring buffer absorbs drift.
- *       No headphone sound yet either way - CXD5247 DMA is still a stub;
- *       judge by Initialize S_OK + NSH STREAMING/Buf growth, NOT by sound).
+/* Sync type selector (Rev76: async is the product default).
+ *   0 = Asynchronous OUT + Feedback IN (EP1, Q16.16 @1ms).
+ *       Host paces packets from our PI-controlled feedback; device-side
+ *       drop/dup servo stays as a safety net behind a wide deadband.
+ *   1 = Adaptive OUT, no Feedback EP (fallback: host paces packets;
+ *       ring buffer + device servo absorb drift. Flip back + rebuild +
+ *       reflash if any host refuses explicit feedback).
  */
-#define UAC2_SYNC_ADAPTIVE            1
+#define UAC2_SYNC_ADAPTIVE            0
 
 /* Rev18 DIAGNOSTIC toggle (revert to 0 after the 2x2 result).
  *   1 = Alt1 is zero-bandwidth (bNumEndpoints=0, no EP descs): tests whether

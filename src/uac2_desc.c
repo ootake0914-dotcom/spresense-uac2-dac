@@ -197,9 +197,10 @@ const uint8_t g_uac2_config_desc_hs[] = {
 };
 #else
 /* High-Speed UAC2 Full Configuration Descriptor.
- * Totals: 202 bytes (0xCA) async with FU; 195 bytes (0xC3) adaptive
- * (feedback descriptor removed); 178 bytes (0xB2) Rev18 diagnostic
- * (Alt1 zero-bandwidth, Alt1 EP descs removed).
+ * Totals: 202 bytes (0xCA) async with FU (multi-alt layout);
+ *         195 bytes (0xC3) adaptive (feedback descriptor removed);
+ *         178 bytes (0xB2) Rev18 diagnostic (Alt1 zero-bandwidth);
+ *         145 bytes (0x91) Rev76 async Alt-0 single (138 + 7B FB EP).
  * mkcfgdesc() patches wTotalLength from
  * sizeof() at runtime, but the static bytes must match for verification.
  */
@@ -208,7 +209,7 @@ const uint8_t g_uac2_config_desc_hs[] = {
     0x09,                               /* bLength */
     USB_DESC_TYPE_CONFIG,               /* bDescriptorType */
 #if UAC2_SINGLE_ALT0_STREAMING
-    0x8A, 0x00,                         /* wTotalLength: 138 bytes (Alt0 single 24-bit PCM streaming) */
+    0x91, 0x00,                         /* wTotalLength: 145 bytes (Rev76 async Alt0 single + FB EP) */
 #elif UAC2_DIAG_ALT1_ZEROBW
     0xB2, 0x00,                         /* wTotalLength: 178 bytes (Alt1 zero-BW diag) */
 #elif UAC2_SYNC_ADAPTIVE
@@ -260,7 +261,7 @@ const uint8_t g_uac2_config_desc_hs[] = {
     ADC_CS_INTERFACE,                   /* bDescriptorType: CS_INTERFACE (0x24) */
     UAC2_AC_CLOCK_SOURCE,               /* bDescriptorSubtype: CLOCK_SOURCE (0x0A) */
     UAC2_ENTITY_CLOCK_SOURCE,           /* bClockID: 4 */
-    0x07,                               /* bmAttributes: Int.Prog.Clock + SOF sync (adaptive requires SOF lock) */
+    0x03,                               /* bmAttributes: Int.Prog.Clock, async (Rev76: DAC free-runs, no SOF lock) */
     0x03,                               /* bmControls: freq R/W (0x03) */
     0x00,                               /* bAssocTerminal: 0 (no association) */
     0x00,                               /* iClockSource */
@@ -313,7 +314,7 @@ const uint8_t g_uac2_config_desc_hs[] = {
     USB_DESC_TYPE_INTERFACE,            /* bDescriptorType */
     UAC2_IF_AUDIO_STREAMING,            /* bInterfaceNumber: 1 */
     0x00,                               /* bAlternateSetting: 0 */
-    0x01,                               /* bNumEndpoints: 1 (EP2 OUT) */
+    0x02,                               /* bNumEndpoints: 2 (EP2 OUT + EP1 IN feedback) */
     ADC_CLASS,                          /* bInterfaceClass: Audio (0x01) */
     UAC2_SUBCLASS_AUDIOSTREAMING,       /* bInterfaceSubClass: AudioStreaming (0x02) */
     ADC_PROTOCOLv20,                    /* bInterfaceProtocol: IP version 2.0 (0x20) */
@@ -343,12 +344,12 @@ const uint8_t g_uac2_config_desc_hs[] = {
     0x09,                               /* bLength: 9 (HS audio EP) */
     USB_DESC_TYPE_ENDPOINT,             /* bDescriptorType */
     UAC2_EP_ISO_OUT,                    /* bEndpointAddress: EP2 OUT (0x02) */
-    0x09,                               /* bmAttributes: Isochronous, Adaptive (0x09) */
+    0x05,                               /* bmAttributes: Isochronous, Asynchronous (0x05) */
     (uint8_t)(UAC2_PACKET_SIZE_24BIT_192K & 0xFF),
     (uint8_t)(UAC2_PACKET_SIZE_24BIT_192K >> 8), /* wMaxPacketSize: 200 bytes */
     0x01,                               /* bInterval: 1 (1 microframe = 125us) */
     0x00,                               /* bRefresh: 0 */
-    0x00,                               /* bSynchAddress: 0 */
+    UAC2_EP_FEEDBACK_IN,                /* bSynchAddress: EP1 IN (explicit feedback) */
 
     /* Class-Specific AS Audio Data Endpoint Descriptor */
     0x08,                               /* bLength */
@@ -357,7 +358,15 @@ const uint8_t g_uac2_config_desc_hs[] = {
     0x00,                               /* bmAttributes: MaxPacketsOnly=0 */
     0x00,                               /* bmControls: None */
     0x01,                               /* bLockDelayUnits: Milliseconds (1) */
-    0x01, 0x00                          /* wLockDelay: 1 ms */
+    0x01, 0x00,                         /* wLockDelay: 1 ms */
+
+    /* Standard AS Feedback Endpoint Descriptor (EP1 IN, Rev76) */
+    0x07,                               /* bLength */
+    USB_DESC_TYPE_ENDPOINT,             /* bDescriptorType */
+    UAC2_EP_FEEDBACK_IN,                /* bEndpointAddress: EP1 IN (0x81) */
+    0x11,                               /* bmAttributes: Isochronous, Feedback (0x11) */
+    0x04, 0x00,                         /* wMaxPacketSize: 4 bytes (Q16.16) */
+    0x04                                /* bInterval: 4 (2^3 uframes = 1ms) */
 #else
     /* ========================================================================= */
     /* Interface 1: AudioStreaming (AS)                                         */

@@ -162,7 +162,10 @@ int main(int argc, char *argv[])
               uac2_audio_get_seq_stats(&dup, &gap, &fdup, &fgap);
               uint32_t svd = 0, svu = 0;
               uac2_audio_get_servo_stats(&svd, &svu);
-              printf("[FEED #%lu] partial:%lu empty:%lu done:%lu erronly:%lu errdone:%lu dup:%lu gap:%lu fdup:%lu fgap:%lu svd:%lu svu:%lu\n",
+              uint32_t fbff = 0;
+              int32_t fberr = 0;
+              uac2_audio_get_fb_stats(&fbff, &fberr);
+              printf("[FEED #%lu] partial:%lu empty:%lu done:%lu erronly:%lu errdone:%lu dup:%lu gap:%lu fdup:%lu fgap:%lu svd:%lu svu:%lu fb:0x%08lx ferr:%ld\n",
                      (unsigned long)(tick_100ms / 10),
                      (unsigned long)pc, (unsigned long)ec,
                      (unsigned long)g_cxd56_aud_donecont,
@@ -170,7 +173,8 @@ int main(int argc, char *argv[])
                      (unsigned long)g_cxd56_aud_errdonecont,
                      (unsigned long)dup, (unsigned long)gap,
                      (unsigned long)fdup, (unsigned long)fgap,
-                     (unsigned long)svd, (unsigned long)svu);
+                     (unsigned long)svd, (unsigned long)svu,
+                     (unsigned long)fbff, (long)fberr);
               printf("[EOGAP #%lu] g0:%lu g1:%lu g2:%lu g3:%lu g4:%lu g5:%lu g6:%lu g7:%lu g8:%lu g9:%lu\n",
                      (unsigned long)(tick_100ms / 10),
                      (unsigned long)g_cxd56_aud_eogap[0],

@@ -172,17 +172,31 @@ static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
 static void uac2_fb_in_complete(struct usbdev_ep_s *ep,
                                 struct usbdev_req_s *req)
 {
-  /* Phase 4: feedback IN complete. Currently one-shot; re-submit while
-   * streaming so host keeps receiving clock ratio.
+  /* Rev76: feedback IN complete. Resubmit-only here (USB IRQ context:
+   * no computation, no printf). Payload is refreshed by the pump thread
+   * (task context) via uac2_feedback_update().
+   * Format (verified): HS Q16.16 LE, samples/microframe.
+   * Nominal 192kHz = 24.0 = 0x00180000.
    */
   if (g_uac2_dev.is_streaming && g_uac2_dev.ep_fb && req == g_uac2_dev.fbreq &&
       req->result == 0)
     {
-      /* TODO Phase 4: compute real Ff from SOF vs CXD5247 MCLK.
-       * For now hold nominal 192kHz ratio: Ff = Fs * 2^13 for HS?
-       * UAC2 feedback is 16.16 or 12.13; send nominal 192000.
-       */
       EP_SUBMIT(ep, req);
+    }
+}
+
+/* Rev76: async-feedback payload writer (pump thread, task context).
+ * The IN-complete callback only resubmits and never touches the buffer,
+ * so this lock-free store is safe (a torn 4B value self-corrects next ms).
+ */
+void uac2_feedback_update(uint32_t ff_q16)
+{
+  if (g_uac2_dev.fbreq)
+    {
+      g_uac2_dev.fbreq->buf[0] = (uint8_t)(ff_q16);
+      g_uac2_dev.fbreq->buf[1] = (uint8_t)(ff_q16 >> 8);
+      g_uac2_dev.fbreq->buf[2] = (uint8_t)(ff_q16 >> 16);
+      g_uac2_dev.fbreq->buf[3] = (uint8_t)(ff_q16 >> 24);
     }
 }
 
@@ -213,7 +227,7 @@ static void uac2_build_fb_in_desc(FAR struct usb_epdesc_s *epdesc)
   epdesc->attr = 0x11; /* Isochronous, Feedback */
   epdesc->mxpacketsize[0] = 0x04;
   epdesc->mxpacketsize[1] = 0x00;
-  epdesc->interval = 0x01; /* 1 uframe = 125us */
+  epdesc->interval = 0x04; /* 2^3 uframes = 1ms (Rev76: PI cadence match) */
 }
 
 
@@ -338,6 +352,18 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       UAC2_TPRINTF("[UAC2] Pre-submitted EP2 OUT request for Alt 0 streaming (len=%u)\n",
              (unsigned)priv->outreq->len);
     }
+#if !UAC2_SYNC_ADAPTIVE
+  /* Rev76 Alt-0 async: arm EP1 IN feedback (configured above).
+   * Submitted once here; the IN-complete callback resubmits while
+   * streaming with the PI-refreshed Q16.16 payload.
+   */
+  if (priv->ep_fb && priv->fbreq)
+    {
+      priv->fbreq->len = 4;
+      EP_SUBMIT(priv->ep_fb, priv->fbreq);
+      UAC2_TPRINTF("[UAC2] EP1 IN feedback armed (nominal 0x00180000)\n");
+    }
+#endif
   uac2_audio_start();
 #endif
 

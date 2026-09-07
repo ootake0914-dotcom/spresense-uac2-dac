@@ -67,6 +67,9 @@ void uac2_audio_get_seq_stats(uint32_t *dup, uint32_t *gap,
 /* サーボ統計の取得 */
 void uac2_audio_get_servo_stats(uint32_t *dropped, uint32_t *dupped);
 
+/* Rev76: async-feedback PI統計の取得（表示用） */
+void uac2_audio_get_fb_stats(uint32_t *ff_q16, int32_t *err_b);
+
 /* 一時診断用：ドライバ通知メッセージ到着カウンタの取得 */
 void uac2_audio_get_msg_stats(uint32_t *msg_underrun, uint32_t *msg_ioerror);
 
@@ -75,6 +78,11 @@ bool uac2_audio_clock_state(void);
 
 /* 一時診断用：直近サンプルの生値（raw / dst）取得 */
 void uac2_audio_get_diag_sample(uint32_t *raw, uint32_t *dst);
+
+/* Rev76: async-feedbackペイロード書込み（uac2_driver.cが実装。
+ * pumpスレッドが1ms毎にPI出力Q16.16を渡す）
+ */
+void uac2_feedback_update(uint32_t ff_q16);
 
 /* Legacy wrappers (signatures frozen by uac2_main.c) */
 
