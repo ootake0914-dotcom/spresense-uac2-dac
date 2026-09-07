@@ -563,28 +563,22 @@ static void *uac2_audio_pump_thread(void *arg)
                   memset(chunk + n, 0, UAC2_AUDIO_BUFFER_SIZE - n);
                 }
             }
-          /* Rev72: S-Master Delta-Sigma Modulator Stability & Anti-Latchup Fix.
-           * S-Master (CXD5247) uses a high-order Delta-Sigma PWM modulator.
-           * At inputs near 0dBFS (especially heavily-mastered J-POP with True Peaks),
-           * the integrator enters limit-cycle oscillation (modulator latch-up).
-           * Once latched, it produces continuous square-wave hash/buzzing until input
-           * is cut below ~50%.
-           * Applying a clean 1-bit attenuation (-6.02 dBFS, via `s << 7`) ensures
-           * the modulator never crosses its instability boundary, eliminating latch-up
-           * permanently while preserving full bit-perfect resolution and zero CPU overhead.
+          /* Rev74: True Bit-Perfect 24-bit MSB-Aligned Direct Transfer.
+           * USB Audio 2.0 specification (Type I Formats) defines that 24-bit PCM
+           * in 4-byte subslots is inherently MSB-aligned (left-justified: bits 8-31
+           * contain audio data, bits 0-7 are zero-padding).
+           * CXD5602/CXD5247 hardware DAC in 32-bit slot mode expects this exact
+           * MSB-aligned format.
+           * Therefore, host data is passed directly with 100% bit-perfect fidelity,
+           * eliminating false 8-bit left shifts (+48dB excessive gain & wrap-around distortion).
            */
+          memcpy(apb->samp, chunk, UAC2_AUDIO_BUFFER_SIZE);
           {
             const uint32_t *src32 = (const uint32_t *)chunk;
-            uint32_t *dst32 = (uint32_t *)apb->samp;
-            for (uint32_t i = 0; i < UAC2_AUDIO_BUFFER_SIZE / 4; i++)
-              {
-                int32_t s = (int32_t)(src32[i] << 8) >> 8;
-                dst32[i] = (uint32_t)(s << 7); /* -6.02 dB S-Master stability headroom */
-              }
             if (src32[0] != 0u)
               {
                 g_diag_raw_sample = src32[0];
-                g_diag_dst_sample = dst32[0];
+                g_diag_dst_sample = src32[0];
               }
           }
           memcpy(g_audio_dma.histframe, chunk + UAC2_AUDIO_BUFFER_SIZE - 8, 8);

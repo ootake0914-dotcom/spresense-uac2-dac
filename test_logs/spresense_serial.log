@@ -1,5 +1,66 @@
-[PUMP] wakes=108809 enq=10216 deq=10200 freetop=0 sem=0 avail=77384
-[PUMP] wakes=116809 enq=10966 deq=10950 freetop=0 sem=0 avail=76640
-[PUMP] wakes=124808 enq=11716 deq=11700 freetop=0 sem=0 avail=75696
-[PUMP] wakes=132808 enq=12466 deq=12450 freetop=0 sem=0 avail=74944
-[PUMP] wakes=140807 enq=13216 deq=13200 freetop=0 sem=0 avail=74000
+[UAC2-AUDIO] Disabling MIC input circuits (clean DAC mode)...
+[UAC2-AUDIO] Unmuting external headphone amplifier...
+[UAC2-AUDIO] NVIC IRQ 103 prio restored 0x80, readback 0x80
+[UAC2-AUDIO] NVIC IRQ 104 prio restored 0x80, readback 0x80
+[UAC2-AUDIO] NVIC IRQ 116 (USB) demoted 0xa0, readback 0xa0
+[UAC2-AUDIO] NVIC IRQ 117 (USB) demoted 0xa0, readback 0xa0
+[UAC2-AUDIO] Opened /dev/audio/pcm0 fd=3
+[UAC2-AUDIO] Pump thread started (priority 150)
+[PUMP] wakes=1 enq=16 deq=0 freetop=0 sem=1 avail=131064
+[UAC2-AUDIO] Reserved start request detected, starting now
+[UAC2-AUDIO] AUDIOIOC_START -> 0 (errno=0)
+[UAC2-AUDIO] CXD5247 DMA Playback started!
+[UAC2-AUDIO] CXD5247 S-Master Ready: 192000 Hz / 2 ch / 32-bit slot
+[UAC2] Audio subsystem initialized successfully!
+[UAC2] Connect Extension Board Micro-USB to PC.
+[UAC2] Monitoring USB Audio Status & Setup Logs...
+
+[EP0] type=0x80 req=0x06 val=0x0100(cs=1,ch=0) idx=0x0000(ent=0,if=0) len=64 -> ret=18
+[EP0] type=0x80 req=0x06 val=0x0100(cs=1,ch=0) idx=0x0000(ent=0,if=0) len=18 -> ret=18
+[EP0] type=0x80 req=0x06 val=0x0f00(cs=15,ch=0) idx=0x0000(ent=0,if=0) len=5 -> ret=27
+[EP0] type=0x80 req=0x06 val=0x0f00(cs=15,ch=0) idx=0x0000(ent=0,if=0) len=33 -> ret=27
+[EP0] type=0x80 req=0x06 val=0x0200(cs=2,ch=0) idx=0x0000(ent=0,if=0) len=9 -> ret=138
+[EP0] type=0x80 req=0x06 val=0x0200(cs=2,ch=0) idx=0x0000(ent=0,if=0) len=138 -> ret=138
+[EP0] type=0x80 req=0x06 val=0x0300(cs=3,ch=0) idx=0x0000(ent=0,if=0) len=255 -> ret=4
+[EP0] type=0x80 req=0x06 val=0x0302(cs=3,ch=2) idx=0x0409(ent=4,if=9) len=255 -> ret=58
+[EP0] type=0x80 req=0x06 val=0x0301(cs=3,ch=1) idx=0x0409(ent=4,if=9) len=255 -> ret=10
+[EP0] type=0x80 req=0x06 val=0x0303(cs=3,ch=3) idx=0x0409(ent=4,if=9) len=255 -> ret=10
+[EP0] type=0x00 req=0x09 val=0x0001(cs=0,ch=1) idx=0x0000(ent=0,if=0) len=0 -> ret=0
+[EP0] type=0x80 req=0x06 val=0x0304(cs=3,ch=4) idx=0x0409(ent=4,if=9) len=255 -> ret=24
+[EP0] type=0x80 req=0x06 val=0x0302(cs=3,ch=2) idx=0x0409(ent=4,if=9) len=255 -> ret=58
+[EP0] type=0x80 req=0x06 val=0x0302(cs=3,ch=2) idx=0x0409(ent=4,if=9) len=255 -> ret=58
+[EP0] type=0x80 req=0x06 val=0x0301(cs=3,ch=1) idx=0x0409(ent=4,if=9) len=255 -> ret=10
+[EP0] type=0xa1 req=0x02 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=2 -> ret=14
+[EP0] type=0xa1 req=0x02 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=14 -> ret=14
+[EP0] type=0x01 req=0x0b val=0x0000(cs=0,ch=0) idx=0x0001(ent=0,if=1) len=0 -> ret=0
+[EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
+[EP0] type=0x01 req=0x0b val=0x0000(cs=0,ch=0) idx=0x0001(ent=0,if=1) len=0 -> ret=0
+[EP0] type=0x01 req=0x0b val=0x0000(cs=0,ch=0) idx=0x0001(ent=0,if=1) len=0 -> ret=0
+[EP0] type=0xa1 req=0x01 val=0x0101(cs=1,ch=1) idx=0x0200(ent=2,if=0) len=1 -> ret=1
+[EP0] type=0xa1 req=0x01 val=0x0102(cs=1,ch=2) idx=0x0200(ent=2,if=0) len=1 -> ret=1
+[EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0200(ent=2,if=0) len=1 -> ret=1
+[EP0] type=0xa1 req=0x02 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=8 -> ret=8
+[EP0] type=0xa1 req=0x02 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=8 -> ret=8
+[EP0] type=0xa1 req=0x02 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=8 -> ret=8
+[EP0] type=0xa1 req=0x01 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=2 -> ret=2
+[EP0] type=0x21 req=0x01 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=2 -> ret=0
+[EP0] type=0xa1 req=0x01 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=2 -> ret=2
+[EP0] type=0x21 req=0x01 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=2 -> ret=0
+[EP0] type=0xa1 req=0x01 val=0x0202(cs=2,ch=2) idx=0x0200(ent=2,if=0) len=2 -> ret=2
+[EP0] type=0xa1 req=0x02 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=8 -> ret=8
+[EP0] type=0xa1 req=0x02 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=8 -> ret=8
+[EP0] type=0xa1 req=0x02 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=8 -> ret=8
+[EP0] type=0xa1 req=0x01 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=2 -> ret=2
+[EP0] type=0x21 req=0x01 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=2 -> ret=0
+[EP0] type=0xa1 req=0x01 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=2 -> ret=2
+[EP0] type=0x21 req=0x01 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=2 -> ret=0
+[EP0] type=0x21 req=0x01 val=0x0201(cs=2,ch=1) idx=0x0200(ent=2,if=0) len=2 -> ret=0
+[EP0] type=0x21 req=0x01 val=0x0202(cs=2,ch=2) idx=0x0200(ent=2,if=0) len=2 -> ret=0
+[EP0] type=0x21 req=0x01 val=0x0200(cs=2,ch=0) idx=0x0200(ent=2,if=0) len=2 -> ret=0
+[EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
+[EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
+[EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
+[EP0] type=0xa1 req=0x01 val=0x0100(cs=1,ch=0) idx=0x0400(ent=4,if=0) len=4 -> ret=4
+[PUMP] wakes=4991 enq=483 deq=467 freetop=0 sem=0 avail=121960
+[PUMP] wakes=12991 enq=1233 deq=1217 freetop=0 sem=0 avail=111576
+[PUMP] wakes=20991 enq=1983 deq=1967 freetop=0 sem=0 avail=105576
