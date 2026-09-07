@@ -755,13 +755,17 @@ int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels)
       printf("[UAC2-AUDIO] WARNING: AUDIOIOC_CONFIGURE returned %d\n", ret);
     }
 
-  /* Set initial volume (100% / 0dB) */
+  /* Set initial volume with -1.5dB safety headroom for S-Master (850 / 1000).
+   * High-loudness sources (J-POP Loudness War tracks, ISP > 0dBFS) cause
+   * S-Master PWM modulator to saturate/over-modulate at 1000 (0dB max).
+   * 850 (~-1.5dB) provides essential True Peak headroom.
+   */
   struct audio_caps_desc_s vol_desc;
   memset(&vol_desc, 0, sizeof(vol_desc));
   vol_desc.caps.ac_len = sizeof(struct audio_caps_s);
   vol_desc.caps.ac_type = AUDIO_TYPE_FEATURE;
   vol_desc.caps.ac_format.hw = AUDIO_FU_VOLUME;
-  vol_desc.caps.ac_controls.hw[0] = 1000; /* 0dB (max) */
+  vol_desc.caps.ac_controls.hw[0] = 850; /* -1.5dB ISP headroom */
   ioctl(g_audio_dma.dev_fd, AUDIOIOC_CONFIGURE, (unsigned long)(uintptr_t)&vol_desc);
 
   /* NOTE: In Rev66, on-the-fly live switching to 192k caused mute.
@@ -927,7 +931,8 @@ void uac2_audio_set_volume(uint8_t volume_percent)
 
   if (g_audio_dma.dev_fd >= 0)
     {
-      uint16_t gain = (uint16_t)((uint32_t)volume_percent * 10u);
+      /* Scale 0..100% to 0..850 (-1.5dB headroom at max) to protect S-Master */
+      uint16_t gain = (uint16_t)((uint32_t)volume_percent * 850u / 100u);
       struct audio_caps_desc_s desc;
       memset(&desc, 0, sizeof(desc));
       desc.caps.ac_len = sizeof(struct audio_caps_s);
