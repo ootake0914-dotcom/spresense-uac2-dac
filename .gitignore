@@ -14,6 +14,7 @@ __pycache__/
 *.debug
 *.built_stamp
 .built_stamp
+*.spk
 
 # Worker build artifacts
 worker/romfs.h
