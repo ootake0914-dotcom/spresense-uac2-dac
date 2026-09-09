@@ -48,12 +48,26 @@
  *   0 = descriptors only: host plays briefly, then stops (no feedback).
  *   1 = + EP_CONFIGURE for EP1 (no submit): SUSTAINED PLAYBACK OK.
  *       Host tolerates the silent feedback EP; device servo does the work.
- *       >>> CURRENT LANDING (open loop + live PI telemetry). <<<
- *   2 = + EP_SUBMIT (paced <=1kHz): BOARD WEDGES (no UART, no sound).
- *       Even a single ISO IN submit kills this DCD -> DO NOT USE without
- *       a DCD-level fix. Kept for future work (ZLP probe candidate).
+ *       (Previous stable landing: open loop + live PI telemetry.)
+ *   2 = + EP_SUBMIT (paced <=1kHz): Rev83 status below.
+ * Rev83 findings (DCD stale-XFERDONE guard added, see patch hunk 6):
+ *   - Submitting no longer wedges the board (the Rev76 wedge predates the
+ *     Phase-2 DCD CSR/SNAK fixes; with the current DCD + the new guard,
+ *     full paced submit survives multi-second streams, audio bit-perfect).
+ *   - Our IN request never completes (inflight stuck): EP1's DMA
+ *     descriptor stays pristine, so IN tokens never reach the DCD's EP1
+ *     wrrequest path. The wire still shows 4 zero bytes @1kHz (IP
+ *     auto-response from empty FIFO, or host-side NAK artifact) which the
+ *     host ignores (nominal pacing continues, playback unaffected).
+ *   - Root cause of the DMA-not-engaging needs silicon docs (UDC CSR for
+ *     ISOC-IN may need more than EP_CONFIGURE programs). Parked: the
+ *     device runs open-loop + servo exactly as at level 1, with the
+ *     submit path exercised and proven harmless.
+ *   SINGLE_SHOT=1 submits exactly one transfer per boot (wedge probe);
+ *   =0 is full paced submit (current).
  */
-#define UAC2_FB_HW_ENABLE             1
+#define UAC2_FB_HW_ENABLE             2
+#define UAC2_FB_SINGLE_SHOT           0
 
 /* Rev18 DIAGNOSTIC toggle (revert to 0 after the 2x2 result).
  *   1 = Alt1 is zero-bandwidth (bNumEndpoints=0, no EP descs): tests whether

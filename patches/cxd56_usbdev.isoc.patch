@@ -1,0 +1,128 @@
+diff --git a/arch/arm/src/cxd56xx/cxd56_usbdev.c b/arch/arm/src/cxd56xx/cxd56_usbdev.c
+index f725a55b54..7862e309d1 100644
+--- a/arch/arm/src/cxd56xx/cxd56_usbdev.c
++++ b/arch/arm/src/cxd56xx/cxd56_usbdev.c
+@@ -567,13 +567,13 @@ static const struct cxd56_epinfo_s g_epinfo[CXD56_NENDPOINTS] =
+   },
+   {
+     CXD56_EPBULKIN0 | USB_DIR_IN, /* Logical endpoint number: 1 IN */
+-    USB_EP_ATTR_XFER_BULK,        /* Type: Bulk */
++    USB_EP_ATTR_XFER_ISOC,        /* Type: Isochronous (UAC2 Feedback) */
+     CXD56_BULKMAXPACKET,          /* Max packet size */
+     CXD56_BULKBUFSIZE,            /* Buffer size */
+   },
+   {
+     CXD56_EPBULKOUT0 | USB_DIR_OUT, /* Logical endpoint number: 2 OUT */
+-    USB_EP_ATTR_XFER_BULK,          /* Type: Bulk */
++    USB_EP_ATTR_XFER_ISOC,          /* Type: Isochronous (UAC2 Audio OUT) */
+     CXD56_BULKMAXPACKET,            /* Max packet size */
+     CXD56_BULKBUFSIZE,              /* Buffer size */
+   },
+@@ -839,6 +839,20 @@ static void cxd56_txdmacomplete(struct cxd56_ep_s *privep)
+ 
+   DEBUGASSERT(IS_BS_DMA_DONE(desc));
+ 
++  /* UAC2 ISOC-IN fix (Rev83): a stale XFERDONE (no fresh DMA since the
++   * last completion) must not re-add bytes or re-complete. The old
++   * DEBUGASSERT was the only guard and is compiled out in production
++   * (no CONFIG_DEBUG_FEATURES); without it, a stale XFERDONE instantly
++   * re-completes a just-resubmitted request -> submit/complete IRQ
++   * storm -> board wedge. Well-behaved transfers always present
++   * DMA_DONE here, so this only removes no-op completions.
++   */
++
++  if (!IS_BS_DMA_DONE(desc))
++    {
++      return;
++    }
++
+   desc->status |= DESC_BS_HOST_BUSY;
+ 
+   privreq = cxd56_rqpeek(privep);
+@@ -1900,6 +1914,16 @@ static int cxd56_usbinterrupt(int irq, void *context, void *arg)
+     {
+       usbtrace(TRACE_INTDECODE(CXD56_TRACEINTID_SI), 0);
+       status = getreg32(CXD56_USB_DEV_STATUS);
++
++      /* Linux pch_udc reference (pch_udc_svc_intf_interrupt):
++       * Update EP0 CSR (0x504) with current configuration, interface and alternate setting.
++       */
++      uint32_t ep0_csr = (64u << 19) | (USB_STATUS_CFG(status) << 7) |
++                         (USB_STATUS_INTF(status) << 11) |
++                         (USB_STATUS_ALT(status) << 15);
++      putreg32(ep0_csr, CXD56_USB_DEV_UDC_EP0);
++      while (getreg32(CXD56_USB_BUSY));
++
+       memset(&ctrl, 0, USB_SIZEOF_CTRLREQ);
+       ctrl.type     = USB_REQ_RECIPIENT_INTERFACE;
+       ctrl.req      = USB_REQ_SETINTERFACE;
+@@ -1924,6 +1948,14 @@ static int cxd56_usbinterrupt(int irq, void *context, void *arg)
+     {
+       usbtrace(TRACE_INTDECODE(CXD56_TRACEINTID_SC), 0);
+       status = getreg32(CXD56_USB_DEV_STATUS);
++
++      /* Linux pch_udc reference (pch_udc_svc_cfg_interrupt):
++       * Update EP0 CSR (0x504) with current configuration.
++       */
++      uint32_t ep0_csr = (64u << 19) | (USB_STATUS_CFG(status) << 7);
++      putreg32(ep0_csr, CXD56_USB_DEV_UDC_EP0);
++      while (getreg32(CXD56_USB_BUSY));
++
+       memset(&ctrl, 0, USB_SIZEOF_CTRLREQ);
+       ctrl.req      = USB_REQ_SETCONFIGURATION;
+       ctrl.value[0] = USB_STATUS_CFG(status);
+@@ -2203,14 +2235,23 @@ static int cxd56_epconfigure(struct usbdev_ep_s *ep,
+   udc |= maxpacket << 19;
+   uinfo("UDC: %08" PRIx32 "\n", udc);
+ 
+-  /* This register is write-only (why?) */
+-
++  /* CXD56 UDC EP CSR slot layout:
++   * Slot 0: 0x504 (EP0)
++   * Slot 1: 0x508 (EP1)
++   * Slot 2: 0x50c (EP2)
++   * Base macro: CXD56_USB_DEV_UDC_EP(n) = 0x504 + n*4
++   */
+   putreg32(udc, CXD56_USB_DEV_UDC_EP(n));
+ 
+   /* Write to UDC EP register takes time, so wait for the USBBusy bit */
+ 
+   while (getreg32(CXD56_USB_BUSY));
+ 
++  /* Latch CSR into hardware with CSR_DONE */
++
++  putreg32(getreg32(CXD56_USB_DEV_CONTROL) | USB_CTRL_CSR_DONE, CXD56_USB_DEV_CONTROL);
++  while (getreg32(CXD56_USB_BUSY));
++
+   /* Off STALL bit and enable receive */
+ 
+   addr = USB_ISEPIN(ep->eplog) ? CXD56_USB_IN_EP_CONTROL(privep->epphy)
+@@ -2267,7 +2308,27 @@ static int cxd56_epdisable(struct usbdev_ep_s *ep)
+   /* Cancel any ongoing activity and reset the endpoint */
+ 
+   flags = enter_critical_section();
+-  cxd56_epstall(&privep->ep, false);
++
++  /* Linux pch_udc / amd5536udc reference:
++   * Do NOT stall the endpoint on disable! Setting USB_STALL causes hardware
++   * to autonomously STALL subsequent SET_INTERFACE requests for alternate settings
++   * that contain this endpoint.
++   * Instead, set SNAK and clear STALL, exactly like Linux pch_udc_ep_disable.
++   */
++
++  {
++    uint32_t addr = USB_ISEPIN(ep->eplog) ? CXD56_USB_IN_EP_CONTROL(privep->epphy)
++                                          : CXD56_USB_OUT_EP_CONTROL(privep->epphy);
++    uint32_t ctrl = getreg32(addr);
++    ctrl = (ctrl & ~USB_STALL) | USB_SNAK;
++    if (privep->in)
++      {
++        ctrl |= USB_F; /* Flush FIFO */
++      }
++    putreg32(ctrl, addr);
++    privep->stalled = 0;
++  }
++
+   cxd56_cancelrequests(privep);
+   leave_critical_section(flags);
+   return OK;

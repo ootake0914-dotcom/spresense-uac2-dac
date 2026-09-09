@@ -38,6 +38,16 @@
 
 #define UAC2_AUDIO_PUMP_CHUNK       4096u
 
+/* Rev84: clock-drift servo (drop/dup correction) master switch.
+ *   1 = enabled (product default): proportional frame drops above 64KB
+ *       and dup-trim below 4KB absorb crystal offset indefinitely.
+ *   0 = pure passthrough (bit-perfect audit mode): no sample is ever
+ *       dropped or duplicated by the pump; overruns still counted by
+ *       the ring. svd/svu freeze at 0, proving non-intervention.
+ * TEMP-AUDIT: 0 for the Rev84 audit build (revert to 1 after).
+ */
+#define UAC2_SERVO_ENABLE           1
+
 int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels);
 int uac2_audio_start(void);
 int uac2_audio_stop(void);
@@ -78,6 +88,22 @@ bool uac2_audio_clock_state(void);
 
 /* 一時診断用：直近サンプルの生値（raw / dst）取得 */
 void uac2_audio_get_diag_sample(uint32_t *raw, uint32_t *dst);
+
+/* ビットパーフェクト検証用CRCの取得（表示時は最終xor済み） */
+void uac2_audio_get_crc_stats(uint32_t *crc, uint32_t *bytes);
+
+/* 書込側監査カウンタの取得 */
+void uac2_audio_get_iso_stats(uint32_t *sum_bytes, uint32_t *sum_calls);
+
+/* Rev81-diag (一時): intakeキャプチャの取得 (MONスレッドが変化時のみ表示) */
+void uac2_audio_get_cap(const uint8_t **head, const uint8_t **frozen,
+                        const uint8_t **roll, bool *hv, bool *fv);
+
+/* 音質確保：ポンプ内イベント計数の取得（MONスレッド表示用） */
+void uac2_audio_get_mon_events(uint32_t *pump_wakes,
+                               uint32_t *newstream, uint32_t *leftover,
+                               uint32_t *fluke, uint32_t *revived,
+                               uint32_t *failed, uint32_t *enq_fail);
 
 /* Rev76: async-feedbackペイロード書込み（uac2_driver.cが実装。
  * pumpスレッドが1ms毎にPI出力Q16.16を渡す）

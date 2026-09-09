@@ -21,4 +21,28 @@ config EXAMPLES_UAC2_DAC_STACKSIZE
 	int "Stack size"
 	default 4096
 
+config EXAMPLES_UAC2_DAC_MON_PRIORITY
+	int "Telemetry monitor thread priority (lower = less audio interference)"
+	default 50
+
+config EXAMPLES_UAC2_DAC_MON_CPU
+	int "Telemetry monitor CPU (sub-core, SMP builds only)"
+	default 1
+
+config EXAMPLES_UAC2_DAC_PUMP_CPU
+	int "Audio pump thread CPU (SMP builds only, 0 = main core)"
+	default 0
+
+config EXAMPLES_UAC2_DAC_ASMP
+	bool "ASMP sub-core telemetry formatter (SubCore 1 worker)"
+	default n
+	select ASMP
+	select FS_ROMFS
+	---help---
+		Boot SubCore 1 with the monw formatter worker (worker/monw,
+		embedded via ROMFS). Telemetry printf formatting moves off the
+		main core; the MON thread only UART-dumps worker text.
+		Falls back to local formatting if the worker fails to boot.
+		Audio is unaffected either way.
+
 endif

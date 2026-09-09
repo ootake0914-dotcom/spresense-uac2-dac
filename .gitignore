@@ -8,3 +8,22 @@ Make.dep
 .depend
 __pycache__/
 *.pyc
+
+# Static libraries and debug outputs
+*.a
+*.debug
+*.built_stamp
+.built_stamp
+
+# Worker build artifacts
+worker/romfs.h
+worker/romfs.img
+worker/romfs/
+worker/monw/monw
+worker/lib/libasmpw.a
+
+# Test logs (preserve committed reference logs)
+test_logs/*.log
+!test_logs/spresense_serial.log
+!test_logs/usbmon_strict.log
+

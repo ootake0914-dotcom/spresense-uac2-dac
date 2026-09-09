@@ -6,17 +6,18 @@
 #include <nuttx/config.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <unistd.h>
 #include "uac2.h"
 #include "uac2_audio_dma.h"
+#include "uac2_monitor.h"
 
 extern int uac2_driver_register(void);
 extern void uac2_driver_poll(void);
 extern void uac2_get_status(bool *is_streaming, uint8_t *alt_setting, uint32_t *sample_rate,
                             uint32_t *underrun, uint32_t *overrun, uint32_t *buffered);
-extern void uac2_dump_setup_logs(void);
 /* SDK側の一時診断スナップショット（DMA ERROR発火瞬間の生値） */
 extern volatile uint32_t g_cxd56_aud_errsnap[8];
 extern volatile int g_cxd56_aud_errsnap_taken;
@@ -39,15 +40,43 @@ int main(int argc, char *argv[])
 
     printf("\n=======================================================\n");
     printf(" Spresense 192kHz / 24-bit USB Audio Class 2.0 (UAC2) DAC\n");
-    printf(" FW Rev68: MS OS 2.0 (WinUSB auto-bind MI_01)\n");
+    printf(" FW Rev84: mono-dt PI + servo switch + stream states + atomics\n");
     printf(" Hardware: Sony CXD5602 + CXD5247 Audio Subsystem\n");
     printf(" Mode: Dedicated USB DAC Firmware (MIDI Engine Disabled)\n");
+    printf(" Audio path: USB-ISR -> ring -> pump(CPU0, no UART) -> DMA\n");
+    printf(" Telemetry: MON thread (low prio, sub-core when SMP)\n");
     printf("=======================================================\n");
 
-    /* 1. Register USB driver FIRST so USB enumeration and control requests
-     * (mmsys.cpl levels/formats) are answered immediately by EP0.
+    /* Rev78 (SMP death fix): AUDIO FIRST, USB SECOND.
+     * Proven by replug test: SET_CONFIG arriving DURING audio init wedges
+     * SMP deterministically (4/4 deaths in the init tail), while the same
+     * SET_CONFIG after init is safe (STREAMING sustained). Previously USB
+     * was registered first for fast enumeration; the ~1s delay costs
+     * nothing against a dead board. With audio fully initialized
+     * (pump thread up, sems valid, DMA pre-fed), the host can enumerate
+     * and stream immediately without ever hitting a half-built pipeline.
      * 一時診断ではUSB登録をスキップする。
      */
+
+    /* 1. Initialize Audio Subsystem (CXD5247 DMA / /dev/pcm0) */
+    printf("[UAC2] Initializing Audio Subsystem (CXD5247 DMA)...\n");
+    fflush(stdout);
+    ret = uac2_audio_dma_init();
+    if (ret < 0) {
+        /* P0: abort init. Continuing to USB registration with a dead audio
+         * pipeline accepts host traffic into an undrained ring (overrun
+         * storm) and serves a non-functional DAC. Pump-thread spawn
+         * failure already reports its errno above.
+         */
+        printf("[UAC2] FATAL: Audio subsystem init failed (%d), aborting.\n", ret);
+        fflush(stdout);
+        return -1;
+    } else {
+        printf("[UAC2] Audio subsystem initialized successfully!\n");
+    }
+    fflush(stdout);
+
+    /* 2. Register USB driver AFTER audio is ready (see above) */
 #if UAC2_DIAG_NO_USB
     printf("[UAC2] DIAG NO_USB mode: skipping USB driver registration\n");
     fflush(stdout);
@@ -64,17 +93,6 @@ int main(int argc, char *argv[])
     fflush(stdout);
 #endif
 
-    /* 2. Initialize Audio Subsystem (CXD5247 DMA / /dev/pcm0) */
-    printf("[UAC2] Initializing Audio Subsystem (CXD5247 DMA)...\n");
-    fflush(stdout);
-    ret = uac2_audio_dma_init();
-    if (ret < 0) {
-        printf("[UAC2] Warning: Audio subsystem init returned %d (continuing USB reg)...\n", ret);
-    } else {
-        printf("[UAC2] Audio subsystem initialized successfully!\n");
-    }
-    fflush(stdout);
-
 #if UAC2_DIAG_NO_USB
     /* USBなし診断：SET_CONFIGが来ないため直接開始し、ポンプを周期起床させる */
     printf("[UAC2] DIAG NO_USB mode: starting audio directly\n");
@@ -85,6 +103,13 @@ int main(int argc, char *argv[])
     printf("[UAC2] Connect Extension Board Micro-USB to PC.\n");
     printf("[UAC2] Monitoring USB Audio Status & Setup Logs...\n\n");
     fflush(stdout);
+
+    /* 音質確保：起動後の定常UARTはMONスレッド専用にする。ここでは起動のみ。 */
+    if (uac2_monitor_init() != 0)
+      {
+        printf("[UAC2] Warning: monitor thread init failed (telemetry quiet)\n");
+        fflush(stdout);
+      }
 
     uint32_t tick_100ms = 0;
     while (1) {
@@ -119,148 +144,93 @@ int main(int argc, char *argv[])
           uac2_audio_write(feedbuf, sizeof(feedbuf));
         }
 #else
-        /* Apply deferred Alt changes (streaming bring-up in task context) */
+        /* Apply deferred Alt changes (streaming bring-up in task context).
+         * Hardware bring-up only; no UART here (rare Alt-change logs stay
+         * inside uac2_driver_poll and fire only on transitions).
+         */
         uac2_driver_poll();
 
-        /* Dump any received EP0 SETUP requests immediately */
-#if !UAC2_SILENT_DIAG
-        uac2_dump_setup_logs();
-#endif
+        /* NOTE: EP0 setup-log drain moved to MON thread (sub-core).
+         * Main/USB path never touches UART in steady state. */
 #endif
 
-        /* Print periodic status every 1 second (10 x 100ms) */
-#if !UAC2_SILENT_DIAG
+        /* Telemetry snapshot: cheap reads only, formatting on MON thread.
+         * Cadence preserved (50 ticks = status batch, 100 ticks = +regs). */
         if (tick_100ms % 50 == 0) {
-            bool is_streaming = false;
-            uint8_t alt = 0;
-            uint32_t sr = 0, underrun = 0, overrun = 0, buffered = 0;
-            uac2_get_status(&is_streaming, &alt, &sr, &underrun, &overrun, &buffered);
+            struct uac2_mon_snapshot_s snap;
+            memset(&snap, 0, sizeof(snap));
+            snap.tick_no = tick_100ms / 10;
 
-            /* 排出路の診断情報（無音時の切り分け用） */
-            bool aplaying = false;
-            int afd = -9;
-            uint32_t enq = 0, deq = 0, aud_udr = 0, rst = 0;
-            int freetop = -9;
-            uac2_audio_get_stats(&aplaying, &afd, &enq, &deq, &aud_udr, &rst, &freetop);
+            uac2_get_status(&snap.is_streaming, &snap.alt, &snap.sample_rate,
+                            &snap.underrun, &snap.overrun, &snap.buffered);
+            uac2_audio_get_stats(&snap.aplaying, &snap.afd, &snap.enq,
+                                 &snap.deq, &snap.aud_udr, &snap.rst,
+                                 &snap.freetop);
+            snap.clk = (int)uac2_audio_clock_state();
+            snap.errcont = g_cxd56_aud_errcont;
 
-            const char *state_str = is_streaming ? "STREAMING (192kHz Active)" :
-                                    (alt > 0 ? "ALT_SETTING_ACTIVE" : "STANDBY (Waiting Host Playback)");
-
-            printf("[UAC2 #%lu] %s | Alt:%u | SR:%lu Hz | Buf:%lu B | Under:%lu | Over:%lu\n",
-                   (unsigned long)(tick_100ms / 10), state_str, (unsigned)alt,
-                   (unsigned long)sr, (unsigned long)buffered,
-                   (unsigned long)underrun, (unsigned long)overrun);
-            printf("[AUD #%lu] playing:%d fd:%d enq:%lu deq:%lu aud_udr:%lu rst:%lu freetop:%d clk:%d errcont:%lu\n",
-                   (unsigned long)(tick_100ms / 10), (int)aplaying, afd,
-                   (unsigned long)enq, (unsigned long)deq,
-                   (unsigned long)aud_udr, (unsigned long)rst, freetop,
-                   (int)uac2_audio_clock_state(), (unsigned long)g_cxd56_aud_errcont);
-            {
-              uint32_t pc = 0, ec = 0;
-              uac2_audio_get_feed_stats(&pc, &ec);
-              uint32_t dup = 0, gap = 0, fdup = 0, fgap = 0;
-              uac2_audio_get_seq_stats(&dup, &gap, &fdup, &fgap);
-              uint32_t svd = 0, svu = 0;
-              uac2_audio_get_servo_stats(&svd, &svu);
-              uint32_t fbff = 0;
-              int32_t fberr = 0;
-              uac2_audio_get_fb_stats(&fbff, &fberr);
-              printf("[FEED #%lu] partial:%lu empty:%lu done:%lu erronly:%lu errdone:%lu dup:%lu gap:%lu fdup:%lu fgap:%lu svd:%lu svu:%lu fb:0x%08lx ferr:%ld\n",
-                     (unsigned long)(tick_100ms / 10),
-                     (unsigned long)pc, (unsigned long)ec,
-                     (unsigned long)g_cxd56_aud_donecont,
-                     (unsigned long)g_cxd56_aud_erronlycont,
-                     (unsigned long)g_cxd56_aud_errdonecont,
-                     (unsigned long)dup, (unsigned long)gap,
-                     (unsigned long)fdup, (unsigned long)fgap,
-                     (unsigned long)svd, (unsigned long)svu,
-                     (unsigned long)fbff, (long)fberr);
-              printf("[EOGAP #%lu] g0:%lu g1:%lu g2:%lu g3:%lu g4:%lu g5:%lu g6:%lu g7:%lu g8:%lu g9:%lu\n",
-                     (unsigned long)(tick_100ms / 10),
-                     (unsigned long)g_cxd56_aud_eogap[0],
-                     (unsigned long)g_cxd56_aud_eogap[1],
-                     (unsigned long)g_cxd56_aud_eogap[2],
-                     (unsigned long)g_cxd56_aud_eogap[3],
-                     (unsigned long)g_cxd56_aud_eogap[4],
-                     (unsigned long)g_cxd56_aud_eogap[5],
-                     (unsigned long)g_cxd56_aud_eogap[6],
-                     (unsigned long)g_cxd56_aud_eogap[7],
-                     (unsigned long)g_cxd56_aud_eogap[8],
-                     (unsigned long)g_cxd56_aud_eogap[9]);
-            }
-            {
-              uint32_t dc = 0, sc = 0;
-              uac2_audio_get_data_stats(&dc, &sc);
-              uint32_t mu = 0, me = 0;
-              uac2_audio_get_msg_stats(&mu, &me);
-              uint32_t r_smp = 0, d_smp = 0;
-              uac2_audio_get_diag_sample(&r_smp, &d_smp);
-              printf("[DAT #%lu] dc:%lu sc:%lu raw:0x%08lx dst:0x%08lx\n",
-                     (unsigned long)(tick_100ms / 10),
-                     (unsigned long)dc, (unsigned long)sc,
-                     (unsigned long)r_smp, (unsigned long)d_smp);
-            }
-            fflush(stdout);
-        }
-#endif
-
-        /* Periodic Hardware Register Dump every 3 seconds */
-#if !UAC2_SILENT_DIAG
-        if (tick_100ms % 100 == 0) {
-            volatile uint32_t *reg_devcfg = (volatile uint32_t *)0x4E200400UL;
-            volatile uint32_t *reg_devctl = (volatile uint32_t *)0x4E200404UL;
-            volatile uint32_t *reg_devsts = (volatile uint32_t *)0x4E200408UL;
-            volatile uint32_t *reg_devintr= (volatile uint32_t *)0x4E20040CUL;
-            volatile uint32_t *reg_ep2ctl = (volatile uint32_t *)0x4E200240UL;
-            volatile uint32_t *reg_ep2sts = (volatile uint32_t *)0x4E200244UL;
-            volatile uint32_t *reg_busy   = (volatile uint32_t *)0x4E200808UL;
-
-            printf("[REG] CFG=0x%08lx CTL=0x%08lx STS=0x%08lx INT=0x%08lx BUSY=0x%08lx | EP2CTL=0x%08lx EP2STS=0x%08lx\n",
-                   (unsigned long)*reg_devcfg, (unsigned long)*reg_devctl, (unsigned long)*reg_devsts,
-                   (unsigned long)*reg_devintr, (unsigned long)*reg_busy,
-                   (unsigned long)*reg_ep2ctl, (unsigned long)*reg_ep2sts);
-
-            /* 音声DMA状態（I2S1OUT系＝pcm0の実体。読取専用）。
-             * 基準 0x0E300000＋オフセット (cxd56_audio_regdef.h)。
-             */
-            volatile uint32_t *au_adr   = (volatile uint32_t *)0x0E3010C0UL;
-            volatile uint32_t *au_smpls = (volatile uint32_t *)0x0E3010C4UL;
-            volatile uint32_t *au_cmd   = (volatile uint32_t *)0x0E3010C8UL;
-            volatile uint32_t *au_chsel = (volatile uint32_t *)0x0E3010D0UL;
-            volatile uint32_t *au_mon   = (volatile uint32_t *)0x0E3010D4UL;
-            volatile uint32_t *au_istat = (volatile uint32_t *)0x0E301144UL;
-
-            printf("[AUDREG] ADR=0x%08lx SMPL=0x%08lx CMD=0x%08lx CHSEL=0x%08lx MON=0x%08lx ISTAT=0x%08lx\n",
-                   (unsigned long)*au_adr, (unsigned long)*au_smpls,
-                   (unsigned long)*au_cmd, (unsigned long)*au_chsel,
-                   (unsigned long)*au_mon, (unsigned long)*au_istat);
-              if (g_cxd56_aud_errsnap_taken)
+            uac2_audio_get_feed_stats(&snap.partial, &snap.empty);
+            uac2_audio_get_seq_stats(&snap.dup, &snap.gap,
+                                     &snap.fdup, &snap.fgap);
+            uac2_audio_get_servo_stats(&snap.svd, &snap.svu);
+            uac2_audio_get_fb_stats(&snap.fbff, &snap.fberr);
+            snap.done = g_cxd56_aud_donecont;
+            snap.erronly = g_cxd56_aud_erronlycont;
+            snap.errdone = g_cxd56_aud_errdonecont;
+            for (int i = 0; i < 10; i++)
               {
-                printf("[ERRSNAP] intbit=0x%08lx stat=0x%08lx mask=0x%08lx mon=0x%08lx smpls=0x%08lx addr=0x%08lx state=%lu errcont=%lu\n",
-                       (unsigned long)g_cxd56_aud_errsnap[0],
-                       (unsigned long)g_cxd56_aud_errsnap[1],
-                       (unsigned long)g_cxd56_aud_errsnap[2],
-                       (unsigned long)g_cxd56_aud_errsnap[3],
-                       (unsigned long)g_cxd56_aud_errsnap[4],
-                       (unsigned long)g_cxd56_aud_errsnap[5],
-                       (unsigned long)g_cxd56_aud_errsnap[6],
-                       (unsigned long)g_cxd56_aud_errcont);
+                snap.eogap[i] = g_cxd56_aud_eogap[i];
               }
-            if (g_cxd56_aud_errsnap2_taken)
-              {
-                printf("[ERRSNAP2] intbit=0x%08lx stat=0x%08lx mask=0x%08lx mon=0x%08lx smpls=0x%08lx addr=0x%08lx state=%lu errcont=%lu\n",
-                       (unsigned long)g_cxd56_aud_errsnap2[0],
-                       (unsigned long)g_cxd56_aud_errsnap2[1],
-                       (unsigned long)g_cxd56_aud_errsnap2[2],
-                       (unsigned long)g_cxd56_aud_errsnap2[3],
-                       (unsigned long)g_cxd56_aud_errsnap2[4],
-                       (unsigned long)g_cxd56_aud_errsnap2[5],
-                       (unsigned long)g_cxd56_aud_errsnap2[6],
-                       (unsigned long)g_cxd56_aud_errsnap2[7]);
-              }
-            fflush(stdout);
+            uac2_audio_get_data_stats(&snap.dc, &snap.sc);
+            uac2_audio_get_msg_stats(&snap.mu, &snap.me);
+            uac2_audio_get_diag_sample(&snap.r_smp, &snap.d_smp);
+            uac2_audio_get_crc_stats(&snap.crc_val, &snap.crc_bytes);
+            uac2_audio_get_iso_stats(&snap.iso_sum_bytes, &snap.iso_sum_calls);
+            uac2_audio_get_mon_events(&snap.pump_wakes,
+                                      &snap.mon_newstream,
+                                      &snap.mon_newstream_leftover,
+                                      &snap.mon_fluke_cancel,
+                                      &snap.mon_restart_revived,
+                                      &snap.mon_restart_failed,
+                                      &snap.mon_enq_fail);
+
+            if (tick_100ms % 100 == 0) {
+                snap.has_reg = true;
+                snap.reg_devcfg  = *(volatile uint32_t *)0x4E200400UL;
+                snap.reg_devctl  = *(volatile uint32_t *)0x4E200404UL;
+                snap.reg_devsts  = *(volatile uint32_t *)0x4E200408UL;
+                snap.reg_devintr = *(volatile uint32_t *)0x4E20040CUL;
+                snap.reg_ep2ctl  = *(volatile uint32_t *)0x4E200240UL;
+                snap.reg_ep2sts  = *(volatile uint32_t *)0x4E200244UL;
+                snap.reg_busy    = *(volatile uint32_t *)0x4E200808UL;
+
+                snap.au_adr   = *(volatile uint32_t *)0x0E3010C0UL;
+                snap.au_smpls = *(volatile uint32_t *)0x0E3010C4UL;
+                snap.au_cmd   = *(volatile uint32_t *)0x0E3010C8UL;
+                snap.au_chsel = *(volatile uint32_t *)0x0E3010D0UL;
+                snap.au_mon   = *(volatile uint32_t *)0x0E3010D4UL;
+                snap.au_istat = *(volatile uint32_t *)0x0E301144UL;
+
+                if (g_cxd56_aud_errsnap_taken)
+                  {
+                    snap.has_errsnap = true;
+                    for (int i = 0; i < 8; i++)
+                      {
+                        snap.errsnap[i] = g_cxd56_aud_errsnap[i];
+                      }
+                  }
+                if (g_cxd56_aud_errsnap2_taken)
+                  {
+                    snap.has_errsnap2 = true;
+                    for (int i = 0; i < 8; i++)
+                      {
+                        snap.errsnap2[i] = g_cxd56_aud_errsnap2[i];
+                      }
+                  }
+            }
+
+            uac2_monitor_push(&snap);
         }
-#endif
     }
 
     return 0;

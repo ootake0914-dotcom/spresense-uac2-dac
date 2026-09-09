@@ -65,6 +65,10 @@ static const struct usb_qualdesc_s g_uac2_qualdesc =
 
 /* BOS descriptor (33B): MS OS 2.0 platform capability only.
  * Lets Windows >= 8.1 auto-bind WinUSB (no INF/signing) for MI_01.
+ * NOTE: the MS OS 2.0 Platform Capability descriptor is 28B and MUST
+ * contain dwWindowsVersion (4B) + wMSOSDescriptorSetTotalLength (2B)
+ * between the UUID and bVendorCode (the missing 6 bytes that made
+ * hosts reject a truncated capability).
  */
 const uint8_t g_uac2_bos_desc[] =
 {
@@ -81,9 +85,14 @@ const uint8_t g_uac2_bos_desc[] =
     0x89, 0x45, 0xC7, 0x4C,
     0x9C, 0xD2, 0x65, 0x9D,
     0x9E, 0x64, 0x8A, 0x9F,
+    0x00, 0x00, 0x03, 0x06,             /* dwWindowsVersion: 8.1 */
+    0x2E, 0x00,                         /* wMSOSDescriptorSetTotalLength: 46 */
     UAC2_MS_VENDOR_CODE,                /* bVendorCode */
     0x00                                /* bAltEnumCode */
 };
+
+_Static_assert(sizeof(g_uac2_bos_desc) == 33,
+               "BOS descriptor must be 33 bytes");
 
 /* MS OS 2.0 Descriptor Set (46B): MI_01 (AS streaming) -> WINUSB.
  * AC (MI_00) stays with usbaudio2 (fails as before, harmless).
@@ -256,13 +265,17 @@ const uint8_t g_uac2_config_desc_hs[] = {
     0x40, 0x00,                         /* wTotalLength: 64 bytes of AC descriptors (with FU) */
     0x00,                               /* bmControls: Latency Control not supported */
 
-    /* Clock Source Descriptor (Entity ID 4) */
+    /* Clock Source Descriptor (Entity ID 4): 192kHz fixed internal clock.
+     * bmAttributes 0x01 = internal FIXED (engine runs 192kHz always;
+     * was 0x03 programmable). bmControls 0x00 = no frequency control
+     * (fixed clock exposes no R/W; RANGE is 192k-only, SET_CUR clamped).
+     */
     0x08,                               /* bLength */
     ADC_CS_INTERFACE,                   /* bDescriptorType: CS_INTERFACE (0x24) */
     UAC2_AC_CLOCK_SOURCE,               /* bDescriptorSubtype: CLOCK_SOURCE (0x0A) */
     UAC2_ENTITY_CLOCK_SOURCE,           /* bClockID: 4 */
-    0x03,                               /* bmAttributes: Int.Prog.Clock, async (Rev76: DAC free-runs, no SOF lock) */
-    0x03,                               /* bmControls: freq R/W (0x03) */
+    UAC2_CLOCK_SOURCE_INT_FIXED,        /* bmAttributes: internal fixed clock */
+    0x00,                               /* bmControls: no freq control (fixed) */
     0x00,                               /* bAssocTerminal: 0 (no association) */
     0x00,                               /* iClockSource */
 

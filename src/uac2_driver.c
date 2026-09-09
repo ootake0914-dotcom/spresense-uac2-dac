@@ -47,6 +47,7 @@ typedef struct
   volatile bool fb_inflight;        /* Rev76: paced submit guard (ISR clears) */
 
   uint8_t config;                   /* Current configuration value */
+  uint8_t config_applied;           /* HW applied config (task context) */
   uint8_t alt_setting;              /* AS interface alt: requested (ISR context) */
   uint8_t alt_applied;              /* AS interface alt: hardware applied (task context) */
 
@@ -139,25 +140,47 @@ static uint16_t uac2_alt_packet_size(uint8_t alt)
 }
 
 static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
-                                  struct usbdev_req_s *req)
+                                   struct usbdev_req_s *req)
 {
   static uint32_t s_pkt_count = 0;
+  static uint32_t s_badlen_count = 0;
 
   /* Audio stream packet received (125us microframe interval) */
   if (req->result == 0 && req->xfrd > 0)
     {
-      s_pkt_count++;
-#if !UAC2_SILENT_DIAG
-      if (s_pkt_count <= 5 || (s_pkt_count % 8000 == 0))
-        {
-          UAC2_TPRINTF("[ISO_OUT] pkt #%lu: %u bytes received!\n",
-                 (unsigned long)s_pkt_count, (unsigned)req->xfrd);
-        }
-#endif
-      /* 給電はg_pcm_ring（uac2_audio_dma.c側）のみ。二重書き込み排除
-       * （Claude指摘：g_uac2_dev.ringbufは誰にもreadされず統計が腐る）。
+      /* P0: 8-byte stereo-frame guard. A non-multiple-of-8 packet means
+       * wire corruption; accepting it (or truncating it) would shift every
+       * subsequent frame and turn all following audio into noise until
+       * stream restart. Drop the whole packet: a 125us gap preserves
+       * alignment (audible click at worst). Oversize is impossible with
+       * the fixed MAXPKT buffer, but guarded anyway.
        */
-      uac2_audio_write(req->buf, req->xfrd);
+      if (req->xfrd > UAC2_ISO_OUT_MAXPKT || (req->xfrd & 7u) != 0)
+        {
+          s_badlen_count++;
+#if !UAC2_SILENT_DIAG
+          if (s_badlen_count <= 5 || (s_badlen_count % 1000 == 0))
+            {
+              UAC2_TPRINTF("[ISO_OUT] BADLEN #%lu: %u bytes dropped (8B guard)\n",
+                     (unsigned long)s_badlen_count, (unsigned)req->xfrd);
+            }
+#endif
+        }
+      else
+        {
+          s_pkt_count++;
+#if !UAC2_SILENT_DIAG
+          if (s_pkt_count <= 5 || (s_pkt_count % 8000 == 0))
+            {
+              UAC2_TPRINTF("[ISO_OUT] pkt #%lu: %u bytes received!\n",
+                     (unsigned long)s_pkt_count, (unsigned)req->xfrd);
+            }
+#endif
+          /* 給電はg_pcm_ring（uac2_audio_dma.c側）のみ。二重書き込み排除
+           * （Claude指摘：g_uac2_dev.ringbufは誰にもreadされず統計が腐る）。
+           */
+          uac2_audio_write(req->buf, req->xfrd);
+        }
     }
 
   /* Re-queue the request for next packet. Buffer is sized for the max
@@ -171,7 +194,7 @@ static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
 }
 
 static void uac2_fb_in_complete(struct usbdev_ep_s *ep,
-                                struct usbdev_req_s *req)
+                                 struct usbdev_req_s *req)
 {
   /* Rev76 paced submit: the IN-complete callback (USB IRQ context) only
    * releases the slot and NEVER resubmits. Resubmission is paced at <=1kHz
@@ -201,7 +224,7 @@ void uac2_feedback_update(uint32_t ff_q16)
     }
 }
 
-/* Rev76: paced feedback submitter (pump thread, task context, <=1kHz).
+/* Rev82: paced feedback submitter (pump thread, task context, <=1kHz).
  * Submits the 4B Q16.16 payload only when streaming and no transfer is
  * in flight. The host polls EP1 every 1ms (bInterval=4); a missed poll
  * simply yields no data that interval (host interpolates).
@@ -209,11 +232,28 @@ void uac2_feedback_update(uint32_t ff_q16)
 void uac2_feedback_poll(void)
 {
 #if (UAC2_FB_HW_ENABLE >= 2)
+  /* Rev82 single-shot experiment: submit exactly ONE feedback transfer
+   * per boot, then go silent. Distinguishes per-transfer toxicity
+   * (board dies on the first IN completion => DCD DMA/desc pathology)
+   * from repetition toxicity (survives one, dies on stream => IRQ pacing
+   * storm). Host-side proof via usbmon EP1-IN transaction.
+   */
+#if UAC2_FB_SINGLE_SHOT
+  static bool s_fb_shot = false;
+  if (s_fb_shot)
+    {
+      return;
+    }
+#endif
   if (g_uac2_dev.is_streaming && g_uac2_dev.ep_fb && g_uac2_dev.fbreq &&
       !g_uac2_dev.fb_inflight)
     {
       g_uac2_dev.fbreq->len = 4;
       g_uac2_dev.fb_inflight = true;
+#if UAC2_FB_SINGLE_SHOT
+      s_fb_shot = true;
+      UAC2_TPRINTF("[UAC2] FB single-shot submit (4B Q16.16)\n");
+#endif
       EP_SUBMIT(g_uac2_dev.ep_fb, g_uac2_dev.fbreq);
     }
 #else
@@ -302,8 +342,71 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       return -EINVAL;
     }
 
-  /* Configure streaming endpoints at SET_CONFIG time so the controller
-   * hardware arms and initializes them before host sends SET_INTERFACE.
+#if UAC2_SINGLE_ALT0_STREAMING
+  /* Rev78: record ONLY. All hardware bring-up (EP_CONFIGURE, CSR arm,
+   * pre-submit, audio_start) is deferred to uac2_driver_poll() task
+   * context. Doing it here (USB ISR context) wedges SMP deterministically
+   * and silently neuters the DMA engine start even when it survives:
+   * UP only ever worked because START happened to run via the deferred
+   * start_pending tail (task context).
+   */
+  priv->is_streaming = true;
+  priv->alt_setting  = 0;
+#else
+  /* Multi-alt legacy: alt bring-up already deferred; just stage Alt-1. */
+  priv->is_streaming = true;
+  priv->alt_setting  = 1;
+#endif
+
+  priv->config = config;
+  return 0;
+}
+
+/* Task-context config bring-up (SMP-safe). Called from uac2_driver_poll()
+ * when priv->config != priv->config_applied. Performs the hardware work
+ * that uac2_setconfig used to do inline in USB ISR context:
+ * EP_CONFIGURE ×2, EP2 CSR arm + CSR_DONE latch, EP2 OUT pre-submit,
+ * and AUDIOIOC_START via uac2_audio_start().
+ */
+
+/* Rev84 (2): direct-MMIO isolation. All raw CXD5602 USB register pokes
+ * live in uac2_hw_* helpers (mechanism); call sites keep policy (values).
+ * Long-term these belong in the DCD (cxd56_usbdev.c via our ISOC patch),
+ * but the DCD is SDK-owned, so isolation here is the pragmatic step.
+ * USBDEV_BASE = 0x4E200000 (cxd5602_memorymap.h: ADSP_BASE + 0x220000).
+ */
+#define UAC2_HW_USBDEV_BASE   0x4E200000UL
+#define UAC2_HW_USB_BUSY      (UAC2_HW_USBDEV_BASE + 0x808UL)
+#define UAC2_HW_DEVCTL        (UAC2_HW_USBDEV_BASE + 0x404UL)
+#define UAC2_HW_UDC_EP(n)     (UAC2_HW_USBDEV_BASE + 0x504UL + ((n) * 4u))
+#define UAC2_HW_CSR_DONE_BIT  (1u << 13)
+
+static void uac2_hw_arm_ep_csr(unsigned ep_no, uint32_t val_csr)
+{
+  volatile uint32_t *usb_busy =
+    (volatile uint32_t *)UAC2_HW_USB_BUSY;
+  volatile uint32_t *reg_csr =
+    (volatile uint32_t *)UAC2_HW_UDC_EP(ep_no);
+  volatile uint32_t *reg_devctl =
+    (volatile uint32_t *)UAC2_HW_DEVCTL;
+
+  while (*usb_busy);
+  *reg_csr = val_csr;
+  while (*usb_busy);
+
+  /* Latch CSR into hardware with CSR_DONE (do NOT touch CSR_PRG!) */
+  *reg_devctl = *reg_devctl | UAC2_HW_CSR_DONE_BIT;
+  while (*usb_busy);
+}
+
+static void uac2_apply_config_task(Uac2Driver *priv)
+{
+  printf("[UAC2] applying config %u (was %u)\n",
+         (unsigned)priv->config, (unsigned)priv->config_applied);
+  fflush(stdout);
+
+  /* Configure streaming endpoints so the controller hardware arms
+   * before the host sends SET_INTERFACE / ISO traffic.
    */
   if (priv->ep_out)
     {
@@ -314,14 +417,8 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       uac2_build_iso_out_desc(&epdesc, 1);
 #endif
       int ret = EP_CONFIGURE(priv->ep_out, &epdesc, false);
-      if (ret < 0)
-        {
-          UAC2_TPRINTF("[UAC2] Failed to configure EP2 OUT: %d\n", ret);
-        }
-      else
-        {
-          UAC2_TPRINTF("[UAC2] EP2 OUT configured successfully\n");
-        }
+      printf("[UAC2] EP2 OUT configure -> %d\n", ret);
+      fflush(stdout);
     }
 
 #if !UAC2_SYNC_ADAPTIVE && (UAC2_FB_HW_ENABLE >= 1)
@@ -330,53 +427,37 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
       struct usb_epdesc_s epdesc;
       uac2_build_fb_in_desc(&epdesc);
       int ret = EP_CONFIGURE(priv->ep_fb, &epdesc, false);
-      if (ret < 0)
-        {
-          UAC2_TPRINTF("[UAC2] Failed to configure EP1 IN: %d\n", ret);
-        }
-      else
-        {
-          UAC2_TPRINTF("[UAC2] EP1 IN configured successfully\n");
-        }
+      printf("[UAC2] EP1 IN configure -> %d\n", ret);
+      fflush(stdout);
     }
 #endif
 
-  /* Arm EP2 OUT CSR slot (0x4E20050C = CXD56_USB_DEV_UDC_EP2) explicitly */
-  {
-    volatile uint32_t *usb_busy = (volatile uint32_t *)0x4E200808UL;
-    volatile uint32_t *reg_ep2_csr = (volatile uint32_t *)0x4E20050CUL;
-    volatile uint32_t *reg_devctl = (volatile uint32_t *)0x4E200404UL;
-
+  /* Rev84 (2): CSR value computation stays here (policy); the raw
+   * register poke lives in uac2_hw_arm_ep_csr() (mechanism).
+   */
 #if UAC2_SINGLE_ALT0_STREAMING
-    uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
-                        (1u << 11) | (0u << 15) | (200u << 19)); /* 0x064008A2 */
+  uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
+                      (1u << 11) | (0u << 15) | (200u << 19)); /* 0x064008A2 */
 #else
-    uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
-                        (1u << 11) | (1u << 15) | (100u << 19)); /* 0x032088A2 */
+  uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
+                      (1u << 11) | (1u << 15) | (100u << 19)); /* 0x032088A2 */
 #endif
 
-    while (*usb_busy);
-    *reg_ep2_csr = val_csr;
-    while (*usb_busy);
-
-    /* Latch CSR into hardware with CSR_DONE (do NOT touch CSR_PRG!) */
-    *reg_devctl = *reg_devctl | (1u << 13);
-    while (*usb_busy);
-
-    UAC2_TPRINTF("[UAC2] Pre-armed EP2 CSR (0x50C) <- 0x%08lx\n", (unsigned long)val_csr);
-  }
+  /* Arm EP2 OUT CSR slot (0x4E20050C = CXD56_USB_DEV_UDC_EP2) explicitly */
+  uac2_hw_arm_ep_csr(2, val_csr);
+  printf("[UAC2] EP2 CSR armed (0x50C) <- 0x%08lx\n", (unsigned long)val_csr);
+  fflush(stdout);
 
 #if UAC2_SINGLE_ALT0_STREAMING
-  /* Immediately arm EP2 OUT for streaming so it is ready for incoming audio */
-  priv->is_streaming = true;
-  priv->alt_setting  = 0;
-  priv->alt_applied  = 0;
+  /* Arm EP2 OUT for streaming so it is ready for incoming audio */
+  priv->alt_applied = 0;
   if (priv->ep_out && priv->outreq)
     {
       priv->outreq->len = UAC2_PACKET_SIZE_24BIT_192K;
       EP_SUBMIT(priv->ep_out, priv->outreq);
-      UAC2_TPRINTF("[UAC2] Pre-submitted EP2 OUT request for Alt 0 streaming (len=%u)\n",
+      printf("[UAC2] EP2 OUT streaming armed (len=%u)\n",
              (unsigned)priv->outreq->len);
+      fflush(stdout);
     }
 #if !UAC2_SYNC_ADAPTIVE && (UAC2_FB_HW_ENABLE >= 2)
   /* Rev76 Alt-0 async: NO submit here. The first and all later submits
@@ -387,8 +468,7 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
   uac2_audio_start();
 #endif
 
-  priv->config = config;
-  return 0;
+  priv->config_applied = priv->config;
 }
 
 static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
@@ -493,7 +573,28 @@ void uac2_driver_poll(void)
   Uac2Driver *priv = &g_uac2_dev;
   uint8_t alt;
 
-  if (!priv->dev || priv->alt_setting == priv->alt_applied)
+  if (!priv->dev)
+    {
+      return;
+    }
+
+  /* Config bring-up first, always in task context (Rev78 SMP fix).
+   * Covers the single-Alt-0 path: EP configure, CSR arm, pre-submit,
+   * audio start. uac2_setconfig (ISR) only stages flags. */
+  if (priv->config != priv->config_applied)
+    {
+      if (priv->config == 0 || priv->config != UAC2_CONFIG_ID)
+        {
+          uac2_audio_stop();
+          priv->config_applied = 0;
+          priv->alt_applied = priv->alt_setting;
+          return;
+        }
+
+      uac2_apply_config_task(priv);
+    }
+
+  if (priv->alt_setting == priv->alt_applied)
     {
       return;
     }
@@ -608,6 +709,7 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
 
   /* Initialize audio state */
   priv->config       = 0;
+  priv->config_applied = 0;
   priv->sample_rate  = UAC2_SAMPLE_RATE_192K;
   priv->alt_setting  = 0;
   priv->alt_applied  = 0;

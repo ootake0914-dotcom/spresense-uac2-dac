@@ -36,6 +36,7 @@ extern bool cxd56_audio_clock_is_enabled(void);
 #include "uac2.h"
 #include "uac2_ringbuf.h"
 #include "uac2_audio_dma.h"
+#include "uac2_monitor.h"
 
 #define UAC2_AUDIO_DEV_PATH         "/dev/audio/pcm0"
 #define UAC2_AUDIO_DEV_ALT          "/dev/pcm0"
@@ -54,6 +55,9 @@ extern bool cxd56_audio_clock_is_enabled(void);
 /* Slot bitwidth: 24-bit PCM in 32-bit container */
 #define UAC2_SLOTWIDTH_32           32u
 #define UAC2_SLOTWIDTH_16           16u
+
+/* Rev84 (5): forward declaration (pump thread calls start on newstream). */
+int uac2_audio_start(void);
 
 struct uac2_audio_dma_s
 {
@@ -117,10 +121,76 @@ struct uac2_audio_dma_s
   volatile uint32_t msg_underrun;
   volatile uint32_t msg_ioerror;
   volatile uint32_t msg_complete;
+  /* 音質確保：ポンプ内UART禁止のためイベントは計数のみ（表示はMONスレッド）。
+   * NEWSTREAM/FLUKE/RESTART/ENQ失敗のprintfはここに畳み込む。 */
+  volatile uint32_t pump_wakes;
+  volatile uint32_t mon_newstream;
+  volatile uint32_t mon_newstream_leftover;
+  volatile uint32_t mon_fluke_cancel;
+  volatile uint32_t mon_restart_revived;
+  volatile uint32_t mon_restart_failed;
+  volatile uint32_t mon_enq_fail;
+  volatile int mon_enq_last_ret;
+  volatile int mon_enq_last_errno;
+  /* ビットパーフェクト検証用CRC32 (IEEE): リング消費バイトのみ積算。
+   * NEWSTREAMでリセットし、1ストリーム=1ウィンドウ。サーボ無介入
+   * (svd/svu/dup/gapゼロ) かつOver凍結ならホストファイルCRCと一致する。 */
+  volatile uint32_t crc_val;
+  volatile uint32_t crc_bytes;
+  /* 書込側監査用: ISRが受け入れた総バイト数と回数 (二重計数切り分け用) */
+  volatile uint32_t iso_sum_bytes;
+  volatile uint32_t iso_sum_calls;
+  /* Rev81-diag (一時): USB intakeキャプチャ (bit-perfect監査用)。
+   * head=当ストリーム先頭64B, roll=直近64B(rolling),
+   * frozen=前ストリーム末尾64B (quiet突入時に凍結)。 */
+  volatile bool cap_need_head;
+  volatile bool cap_head_valid;
+  volatile bool cap_frozen_valid;
+  uint8_t cap_head[64];
+  uint8_t cap_roll[64];
+  uint8_t cap_frozen[64];
 };
+
+static uint32_t g_crc_tab[256];
+static bool g_crc_tab_ok = false;
 
 static struct uac2_audio_dma_s g_audio_dma;
 static Uac2RingBuffer g_pcm_ring;
+
+static void uac2_crc_init(void)
+{
+  if (g_crc_tab_ok)
+    {
+      return;
+    }
+  for (uint32_t i = 0; i < 256u; i++)
+    {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++)
+        {
+          c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+      g_crc_tab[i] = c;
+    }
+  g_crc_tab_ok = true;
+}
+
+static inline void uac2_crc_reset(void)
+{
+  g_audio_dma.crc_val = 0xFFFFFFFFu;
+  g_audio_dma.crc_bytes = 0;
+}
+
+static inline void uac2_crc_update(const uint8_t *p, uint32_t n)
+{
+  uint32_t c = g_audio_dma.crc_val;
+  for (uint32_t i = 0; i < n; i++)
+    {
+      c = g_crc_tab[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
+    }
+  g_audio_dma.crc_val = c;
+  g_audio_dma.crc_bytes += n;
+}
 static volatile uint32_t g_diag_raw_sample = 0;
 static volatile uint32_t g_diag_dst_sample = 0;
 
@@ -146,10 +216,16 @@ static struct uac2_fb_pi_s g_fb_pi;
 static uint32_t g_fb_last_ff = UAC2_FB_NOMINAL_Q16;
 static int32_t g_fb_last_err = 0;
 
-static uint32_t uac2_fb_pi_update(struct uac2_fb_pi_s *pi, uint32_t level_b)
+/* Rev84: dt-normalized PI (dt_ms = measuredCADENCE, CLOCK_MONOTONIC).
+ * istate is byte*ms: istate += e * dt_ms keeps integrator gain exact
+ * under pump jitter (was: assumed 1ms tick). lvl low-pass alpha scales
+ * with dt as well. Callers clamp dt to [1, 50]ms.
+ */
+static uint32_t uac2_fb_pi_update(struct uac2_fb_pi_s *pi, uint32_t level_b,
+                                  uint32_t dt_ms)
 {
-  /* 1ms low-pass (absorbs +/-4KB reserve steps so feedback never chatters) */
-  pi->lvl_filt += ((int32_t)level_b - pi->lvl_filt) / 16;
+  /* dt-scaled low-pass (alpha ~= dt/16; absorbs +/-4KB reserve steps) */
+  pi->lvl_filt += ((int32_t)level_b - pi->lvl_filt) * (int32_t)dt_ms / 16;
 
   int32_t e = (int32_t)UAC2_FB_TARGET_B - pi->lvl_filt;
   if (e > -UAC2_FB_DEADBAND_B && e < UAC2_FB_DEADBAND_B)
@@ -169,7 +245,7 @@ static uint32_t uac2_fb_pi_update(struct uac2_fb_pi_s *pi, uint32_t level_b)
    */
   if (!((out_ol >= hi && e > 0) || (out_ol <= lo && e < 0)))
     {
-      pi->istate += e; /* per 1ms tick */
+      pi->istate += e * (int32_t)dt_ms; /* byte*ms: dt-normalized */
       if (pi->istate >  UAC2_FB_I_MAX) pi->istate =  UAC2_FB_I_MAX;
       if (pi->istate < -UAC2_FB_I_MAX) pi->istate = -UAC2_FB_I_MAX;
     }
@@ -280,16 +356,12 @@ static void drain_audio_msgs(mqd_t mq)
           case AUDIO_MSG_UNDERRUN:
             g_audio_dma.underrun_count++;
             g_audio_dma.msg_underrun++;
-            printf("[UAC2-AUDIO] MSG UNDERRUN #%lu\n",
-                   (unsigned long)g_audio_dma.msg_underrun);
-            fflush(stdout);
+            /* 音質確保：オーディオ経路でUART禁止。計数のみ（MON表示）。 */
             g_audio_dma.restart_needed = 1;
             break;
           case AUDIO_MSG_IOERROR:
             g_audio_dma.msg_ioerror++;
-            printf("[UAC2-AUDIO] MSG IOERROR #%lu\n",
-                   (unsigned long)g_audio_dma.msg_ioerror);
-            fflush(stdout);
+            /* 音質確保：オーディオ経路でUART禁止。計数のみ（MON表示）。 */
             g_audio_dma.restart_needed = 2;
             break;
           case AUDIO_MSG_COMPLETE:
@@ -313,8 +385,12 @@ static void *uac2_audio_pump_thread(void *arg)
 
   printf("[UAC2-AUDIO] Pump thread started (priority 150)\n");
 
-  /* 一時診断：ポンプ自身の定期報告（生存確認＋排出監視用） */
-  uint32_t pump_wakes = 0;
+  /* 音質確保：ポンプはメインCPUに固定し、MON（ログ）はサブコアへ。
+   * シングルコアビルドでは何もしない。 */
+  uac2_pin_self_to_cpu(UAC2_PUMP_CPU);
+
+  /* 一時診断：ポンプ自身の定期報告は廃止（UARTはMONスレッド専用）。
+   * wakesはカウンタに残し、1秒スナップショット経由でMONが表示する。 */
   /* ストリーム検出（ESP new_play儀式）：50ms以上の無到着gap後の初到着を
    * 新ストリームとし、前ストリーム残渣を捨てて位相を確定させる。
    * tail=headの1ストアのみ（memset掃除は競合・遅延のため不可）。
@@ -322,6 +398,7 @@ static void *uac2_audio_pump_thread(void *arg)
   uint32_t last_pc = 0;
   uint32_t quiet_wakes = 0;
   uint32_t stream_seq = 0;
+  uint32_t last_frozen_pc = 0; /* Rev81-diag: frozen済みpc (二重凍結防止) */
 
   while (g_audio_dma.thread_run)
     {
@@ -339,32 +416,10 @@ static void *uac2_audio_pump_thread(void *arg)
           }
         sem_timedwait(&g_audio_dma.pump_sem, &ts);
       }
-      pump_wakes++;
+      g_audio_dma.pump_wakes++;
 
-      /* 計測printは壁時計1秒に1回まで（TX負荷軽減。+40秒沈黙対策）。
-       * 再生中はUSB起床でwakeが爆発するためwake数基準は不可。
-       * SILENT_DIAG時は全面停止（UART wedge切り分け用）。
-       */
-#if !UAC2_SILENT_DIAG
-      {
-        struct timespec nowts;
-        static time_t last_pump_sec = 0;
-        clock_gettime(CLOCK_REALTIME, &nowts);
-        if (nowts.tv_sec != last_pump_sec)
-          {
-            last_pump_sec = nowts.tv_sec;
-            int sval = -99;
-            sem_getvalue(&g_audio_dma.pump_sem, &sval);
-            printf("[PUMP] wakes=%lu enq=%lu deq=%lu freetop=%d sem=%d avail=%lu\n",
-                   (unsigned long)pump_wakes,
-                   (unsigned long)g_audio_dma.enqueue_count,
-                   (unsigned long)g_audio_dma.dequeue_count,
-                   g_audio_dma.free_top, sval,
-                   (unsigned long)uac2_ringbuf_available_read(&g_pcm_ring));
-            fflush(stdout);
-          }
-      }
-#endif
+      /* 音質確保：ポンプ内のUART定期報告は全廃（MONスレッドが1秒毎に表示）。
+       * ここでは計数のみ。TX割込み・バス競合をオーディオ経路から排除する。 */
 
       if (!g_audio_dma.is_playing || g_audio_dma.dev_fd < 0)
         {
@@ -382,18 +437,37 @@ static void *uac2_audio_pump_thread(void *arg)
       /* Rev76: async-feedback PI @1ms cadence (task context).
        * Refreshes the EP1 IN payload the host polls every 1ms.
        */
+      /* Rev84: async-feedback PI on CLOCK_MONOTONIC with measured dt.
+       * REALTIME is wrong for control loops (NTP steps); the fixed-1ms
+       * assumption mis-scales gains under pump jitter. dt is clamped to
+       * [1,50]ms so revive stalls cannot wind up the integrator.
+       */
       {
         static struct timespec fb_last = {0, 0};
+        static bool fb_last_valid = false;
         struct timespec fb_now;
-        clock_gettime(CLOCK_REALTIME, &fb_now);
-        long fb_dms = (fb_now.tv_sec - fb_last.tv_sec) * 1000L +
-                      (fb_now.tv_nsec - fb_last.tv_nsec) / 1000000L;
+        long fb_dms;
+        uint32_t dt_ms;
+        clock_gettime(CLOCK_MONOTONIC, &fb_now);
+        if (!fb_last_valid)
+          {
+            fb_last = fb_now;
+            fb_last_valid = true;
+          }
+        fb_dms = (fb_now.tv_sec - fb_last.tv_sec) * 1000L +
+                 (fb_now.tv_nsec - fb_last.tv_nsec) / 1000000L;
         if (fb_dms >= 1)
           {
+            dt_ms = (uint32_t)fb_dms;
+            if (dt_ms > 50u)
+              {
+                dt_ms = 50u;
+              }
             fb_last = fb_now;
             g_fb_last_ff = uac2_fb_pi_update(
                              &g_fb_pi,
-                             uac2_ringbuf_available_read(&g_pcm_ring));
+                             uac2_ringbuf_available_read(&g_pcm_ring),
+                             dt_ms);
             uac2_feedback_update(g_fb_last_ff);
             uac2_feedback_poll();
           }
@@ -409,13 +483,25 @@ static void *uac2_audio_pump_thread(void *arg)
                 uint32_t left = uac2_ringbuf_available_read(&g_pcm_ring);
                 if (left > 0)
                   {
-                    g_pcm_ring.tail = g_pcm_ring.head;
+                    uac2_ringbuf_flush(&g_pcm_ring);
                   }
                 stream_seq++;
-                printf("[UAC2-AUDIO] NEWSTREAM #%lu leftover=%lu (mod8=%lu)\n",
-                       (unsigned long)stream_seq, (unsigned long)left,
-                       (unsigned long)(left & 7u));
-                fflush(stdout);
+                /* 音質確保：UART禁止。MONスレッドが表示する。 */
+                g_audio_dma.mon_newstream = stream_seq;
+                g_audio_dma.mon_newstream_leftover = left;
+                /* 新ストリーム=新CRCウィンドウ */
+                uac2_crc_reset();
+                /* Rev81-diag: 次writeが新頭を採取 (frozenはquiet突入時に確定済み) */
+                g_audio_dma.cap_need_head = true;
+                /* Rev84 (5): explicit stream-start transition. Ensures the
+                 * engine runs (covers config-0 stop -> stream without a
+                 * fresh SET_CONFIG). No-op when already playing (no ioctl).
+                 * NOTE: must stay a no-op in the common case — issuing a
+                 * real START here while a STOP is still STOPPING hangs the
+                 * pump (SDK corner). See the removed auto-stop above.
+                 * First packets are already safe in the 128KB ring.
+                 */
+                uac2_audio_start();
               }
             last_pc = pc;
             quiet_wakes = 0;
@@ -423,6 +509,23 @@ static void *uac2_audio_pump_thread(void *arg)
         else if (quiet_wakes < 1000000u)
           {
             quiet_wakes++;
+            /* Rev81-diag: ストリーム終端確定でrolling=旧末尾を凍結。
+             * 新頭armは newstream側 (初回到着時) で行う。 */
+            if (quiet_wakes == 25 && last_pc != last_frozen_pc)
+              {
+                memcpy(g_audio_dma.cap_frozen, g_audio_dma.cap_roll, 64u);
+                g_audio_dma.cap_frozen_valid = true;
+                last_frozen_pc = last_pc;
+              }
+            /* Rev84 (5): auto-stop REMOVED (was: stop engine at quiet>=250).
+             * Reason: AUDIOIOC_START issued from newstream while a prior
+             * STOP is still STOPPING hangs the pump forever (SDK corner:
+             * STOPPING-complete ISR never arrives -> START never returns).
+             * Observed: pump death, intake overruns, frozen CRC. The engine
+             * stays running across streams (zero-fill idle); restart on
+             * newstream is a safe no-op via is_playing. A future fix needs
+             * msg_complete-gated START (async), not stop/start pairing.
+             */
           }
       }
 
@@ -438,6 +541,29 @@ static void *uac2_audio_pump_thread(void *arg)
       if (g_audio_dma.restart_needed)
         {
           g_audio_dma.restart_needed = 0;
+          if (!g_audio_dma.is_playing)
+            {
+              /* Rev84 (5): stale recovery request for an intentionally
+               * stopped engine (stream-end auto-stop). The underrun
+               * message predates the stop; drain the queue and ignore
+               * instead of pointlessly restarting an idle engine.
+               */
+              drain_audio_msgs(g_audio_dma.mq);
+            }
+          else
+            {
+          /* Rev84 (5): post-close fast path. quiet>=250 proves no traffic
+           * (a startup dip always has pc advancing, quiet~=0), so the
+           * 100ms fluke-gate below would only stall the pump (85ms ring!)
+           * and amplify the next stream into overruns. Skip straight to
+           * genuine recovery. Mid-stream behavior unchanged.
+           */
+          if (quiet_wakes >= 250)
+            {
+              g_audio_dma.mon_fluke_cancel++;
+            }
+          else
+            {
           uint32_t g0 = g_audio_dma.dequeue_count;
           usleep(50000);
           drain_audio_msgs(g_audio_dma.mq);
@@ -447,9 +573,8 @@ static void *uac2_audio_pump_thread(void *arg)
           uint32_t g2 = g_audio_dma.dequeue_count;
           if ((g1 - g0) >= 10 && (g2 - g1) >= 10)
             {
-              printf("[UAC2-AUDIO] RESTART FLUKE-cancel (deq %lu+%lu, engine alive)\n",
-                     (unsigned long)(g1 - g0), (unsigned long)(g2 - g1));
-              fflush(stdout);
+              /* 音質確保：UART禁止。MONスレッドが表示する。 */
+              g_audio_dma.mon_fluke_cancel++;
             }
           else
             {
@@ -458,6 +583,7 @@ static void *uac2_audio_pump_thread(void *arg)
           int stopped_once = 0;
           int revived = 0;
           int consec = 0;
+          int start_errs = 0; /* Rev84 (4): consecutive START failures */
           for (int t = 0; t < 300; t++)
             {
               drain_audio_msgs(g_audio_dma.mq);
@@ -467,8 +593,7 @@ static void *uac2_audio_pump_thread(void *arg)
                 {
                   int stop_ret = ioctl(g_audio_dma.dev_fd, AUDIOIOC_STOP, 0);
                   stopped_once = 1;
-                  printf("[UAC2-AUDIO] RESTART stop issued ret=%d\n", stop_ret);
-                  fflush(stdout);
+                  (void)stop_ret;
                   drain_audio_msgs(g_audio_dma.mq);
                 }
               int refill = 0;
@@ -496,17 +621,20 @@ static void *uac2_audio_pump_thread(void *arg)
                     }
                 }
               int start_ret = ioctl(g_audio_dma.dev_fd, AUDIOIOC_START, 0);
+              if (start_ret < 0)
+                {
+                  start_errs++;
+                }
+              else
+                {
+                  start_errs = 0;
+                }
+              (void)refill;
               uint32_t deq0 = g_audio_dma.dequeue_count;
               usleep(3000);
               drain_audio_msgs(g_audio_dma.mq);
               uint32_t deq1 = g_audio_dma.dequeue_count;
-              if ((t % 50) == 0 || (deq1 - deq0) >= 2)
-                {
-                  printf("[UAC2-AUDIO] RESTART try=%d refill=%d free=%d start=%d deq_adv=%lu stop=%d\n",
-                         t, refill, g_audio_dma.free_top, start_ret,
-                         (unsigned long)(deq1 - deq0), stopped_once);
-                  fflush(stdout);
-                }
+              /* 音質確保：try毎のUART禁止（300回分のprintfはジッタ源）。 */
               if ((deq1 - deq0) >= 2)
                 {
                   consec++;
@@ -521,9 +649,34 @@ static void *uac2_audio_pump_thread(void *arg)
                   consec = 0;
                 }
             }
-          printf("[UAC2-AUDIO] RESTART %s\n", revived ? "REVIVED" : "FAILED");
-          fflush(stdout);
+          /* 音質確保：結果は計数のみ。MONスレッドが表示する。 */
+          if (revived)
+            {
+              g_audio_dma.mon_restart_revived++;
+            }
+          else
+            {
+              g_audio_dma.mon_restart_failed++;
+              /* Rev84 (4): persistent START failure is fatal-class.
+               * deq-based revive failing is one thing; the engine
+               * refusing START 300 times straight means hardware-level
+               * death. Say so loudly (once) instead of spinning forever.
+               */
+              if (start_errs >= 300)
+                {
+                  static bool s_start_fatal_logged = false;
+                  if (!s_start_fatal_logged)
+                    {
+                      s_start_fatal_logged = true;
+                      printf("[UAC2-AUDIO] FATAL: AUDIOIOC_START failed 300x "
+                             "straight (engine dead, check CXD5247/clock)\n");
+                      fflush(stdout);
+                    }
+                }
+            }
             } /* end else (genuine flat death) */
+            } /* end else (mid-stream: run fluke gate; Rev84 (5)) */
+            } /* end else (engine playing; Rev84 (5) stale-guard) */
         }
 
       /* リングバッファ→空きAPBへ給電する。最優先原則：エンジンを飢餓に
@@ -555,7 +708,9 @@ static void *uac2_audio_pump_thread(void *arg)
            * Deadband: 32KB - 64KB (zero intervention, pure passthrough).
            * High levels trigger proportional frame dropping (8 bytes/frame)
            * to strictly prevent buffer from ever reaching 128KB wall (Overrun).
+           * Rev84: compiled out when UAC2_SERVO_ENABLE=0 (audit mode).
            */
+#if UAC2_SERVO_ENABLE
           if (avail > 64u * 1024u)
             {
               g_audio_dma.servo_tick++;
@@ -590,6 +745,7 @@ static void *uac2_audio_pump_thread(void *arg)
                   avail = uac2_ringbuf_available_read(&g_pcm_ring);
                 }
             }
+#endif /* UAC2_SERVO_ENABLE (drop servo) */
           /* リングreserve・二層式：2APB分（4096B≒2.7ms）未満の端数は、
            * in-flightが十分（>=8、cushion約10ms以上）ある時だけ待つ。
            * 供給ジッタのdipによるゼロ埋めpartial（可聴プツプツ）を消す。
@@ -610,8 +766,10 @@ static void *uac2_audio_pump_thread(void *arg)
                        UAC2_AUDIO_BUFFER_SIZE : avail;
           /* dup-trim：浅い水位からのフルtake時に直前frameを1つ反復し、
            * 消費を8B遅らせて水位低下を相殺する（8takeに1回まで）。
+           * Rev84: UAC2_SERVO_ENABLE=0では無効（pure passthrough）。
            */
           int dup_this = 0;
+#if UAC2_SERVO_ENABLE
           if (n == UAC2_AUDIO_BUFFER_SIZE && avail < 4096u)
             {
               g_audio_dma.servo_tick++;
@@ -620,6 +778,7 @@ static void *uac2_audio_pump_thread(void *arg)
                   dup_this = 1;
                 }
             }
+#endif /* UAC2_SERVO_ENABLE (dup-trim) */
           if (n == 0)
             {
               g_audio_dma.empty_chunks++;
@@ -641,12 +800,18 @@ static void *uac2_audio_pump_thread(void *arg)
                                 (uint8_t *)apb->samp + 8,
                                 UAC2_AUDIO_BUFFER_SIZE - 8);
               g_audio_dma.dupped_frames++;
+              /* CRCは新規消費分のみ（反復8Bは除外。dup発火時は
+               * 照合対象外になることをsvd/svuで確認する） */
+              uac2_crc_update((const uint8_t *)apb->samp + 8,
+                              UAC2_AUDIO_BUFFER_SIZE - 8);
             }
           else
             {
               if (n > 0)
                 {
                   uac2_ringbuf_read(&g_pcm_ring, (uint8_t *)apb->samp, n);
+                  /* ゼロパディング部は除外し、実ストリームバイトのみ */
+                  uac2_crc_update((const uint8_t *)apb->samp, n);
                 }
               if (n < UAC2_AUDIO_BUFFER_SIZE)
                 {
@@ -695,15 +860,11 @@ static void *uac2_audio_pump_thread(void *arg)
             }
           else
             {
-              /* 投入失敗は無言で捨てない（無音時の切り分け情報になるため間引き表示） */
-              static volatile uint32_t enq_fail_count = 0;
-              enq_fail_count++;
-              if (enq_fail_count == 1 || (enq_fail_count % 200) == 0)
-                {
-                  printf("[UAC2-AUDIO] ENQUEUEBUFFER failed #%lu ret=%d errno=%d\n",
-                         (unsigned long)enq_fail_count, ret, errno);
-                  fflush(stdout);
-                }
+              /* 音質確保：投入失敗もUART禁止。計数＋最終errnoのみ保持し、
+               * MONスレッドが1秒毎に表示する。 */
+              g_audio_dma.mon_enq_fail++;
+              g_audio_dma.mon_enq_last_ret = ret;
+              g_audio_dma.mon_enq_last_errno = errno;
               free_pool_push(apb);
               break;
             }
@@ -725,6 +886,17 @@ int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels)
   g_audio_dma.mute = false;
 
   uac2_ringbuf_init(&g_pcm_ring);
+  uac2_crc_init();
+  uac2_crc_reset();
+  /* Rev81-diag: 初ストリームの頭を採取するためarm (memsetで全偽済み) */
+  g_audio_dma.cap_need_head = true;
+
+  /* SMP hardening: USB-ISR (uac2_audio_write) can fire as soon as the host
+   * enumerates, i.e. long before init finishes (SET_CONFIG races power-up).
+   * sem_post on an uninitialized sem is fatal on SMP (garbage spinlock),
+   * benign-looking on UP. Init the pump sem FIRST so ISR contact is safe.
+   */
+  sem_init(&g_audio_dma.pump_sem, 0, 0);
 
   /* Rev68: True 192kHz Native Playback Fix.
    * CXD5247 S-Master cannot be switched on-the-fly (hot-switched).
@@ -907,7 +1079,9 @@ int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels)
         }
     }
 
-  sem_init(&g_audio_dma.pump_sem, 0, 0);
+  /* pump_sem was already inited at the top of init (SMP hardening:
+   * ISR contact before this point must be safe). Do NOT re-init here:
+   * posts may already be queued from early ISO traffic. */
   g_audio_dma.thread_run = true;
 
   /* Spawn pump thread with high priority */
@@ -922,7 +1096,13 @@ int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels)
   pthread_attr_destroy(&pattr);
   if (ret != 0)
     {
-      printf("[UAC2-AUDIO] ERROR: Failed to create pump thread: %d\n", ret);
+      /* P0: abort init. A half-built pipeline (is_initialized=true with no
+       * pump) would accept USB traffic into a ring nobody drains: silent
+       * overrun storm + wedged engine. Fail loudly instead.
+       */
+      printf("[UAC2-AUDIO] ERROR: Failed to create pump thread: %d (aborting init)\n", ret);
+      g_audio_dma.thread_run = false;
+      return -ret;
     }
 
   g_audio_dma.is_initialized = true;
@@ -960,13 +1140,23 @@ int uac2_audio_start(void)
       return 0;
     }
 
-  g_audio_dma.is_playing = true;
+  /* Rev84 (4): set is_playing only on success. A failed START must not
+   * leave is_playing=true (that feeds a dead engine into an underrun
+   * loop). Callers retry on next newstream; error propagates.
+   */
   if (g_audio_dma.dev_fd >= 0)
     {
       int sret = ioctl(g_audio_dma.dev_fd, AUDIOIOC_START, 0);
+      int serr = (sret < 0) ? errno : 0;
       UAC2_TPRINTF("[UAC2-AUDIO] AUDIOIOC_START -> %d (errno=%d)\n", sret,
-             (sret < 0) ? errno : 0);
+             serr);
+      if (sret < 0)
+        {
+          /* NuttX ioctl returns -errno directly. */
+          return sret;
+        }
     }
+  g_audio_dma.is_playing = true;
   sem_post(&g_audio_dma.pump_sem);
   UAC2_TPRINTF("[UAC2-AUDIO] CXD5247 DMA Playback started!\n");
   return 0;
@@ -999,9 +1189,46 @@ int uac2_audio_write(const void *buffer, size_t bytes)
       return 0;
     }
 
+  /* P0: 8-byte stereo-frame guard (defense in depth; the driver already
+   * filters, but DIAG feeders call here directly). Never accept a
+   * non-multiple-of-8 length: it would misalign every subsequent frame.
+   */
+  if ((bytes & 7u) != 0)
+    {
+      return 0;
+    }
+
+  /* SMP hardening: drop pre-init packets. The ring/pump don't exist yet and
+   * the pump sem was only just inited; early traffic is stale anyway
+   * (stream restarts cleanly on first post-init packet via NEWSTREAM). */
+  if (!g_audio_dma.is_initialized)
+    {
+      return 0;
+    }
+
   /* Non-blocking ISR-safe write into lock-free ring buffer */
   uint32_t accepted = uac2_ringbuf_write(&g_pcm_ring, buffer, (uint32_t)bytes);
   g_audio_dma.iso_pkt_count++; /* ストリーム検出用（ポンプ側が50ms gap判定） */
+  g_audio_dma.iso_sum_bytes += accepted;
+  g_audio_dma.iso_sum_calls++;
+
+  /* Rev81-diag (一時): intake capture。ISR負荷は64B memcpyのみ。
+   * accepted<64の断片はroll更新のみ見送る (無菌試験では192B固定のはず)。 */
+  if (accepted > 0)
+    {
+      const uint8_t *bp = (const uint8_t *)buffer;
+      if (accepted >= 64u)
+        {
+          memcpy(g_audio_dma.cap_roll, bp + accepted - 64u, 64u);
+        }
+      if (g_audio_dma.cap_need_head)
+        {
+          uint32_t hn = (accepted >= 64u) ? 64u : accepted;
+          memcpy(g_audio_dma.cap_head, bp, hn);
+          g_audio_dma.cap_head_valid = true;
+          g_audio_dma.cap_need_head = false;
+        }
+    }
 
 #if 1 /* Rev48: USB起床を復活（Rev41で一時停止）。
        * 再生開始ERRとは無関係と確定済み。供給即応でpartial削減を狙う。
@@ -1139,6 +1366,46 @@ void uac2_audio_get_diag_sample(uint32_t *raw, uint32_t *dst)
 {
   if (raw) *raw = g_diag_raw_sample;
   if (dst) *dst = g_diag_dst_sample;
+}
+
+/* ビットパーフェクト検証用CRCの取得（表示時は最終xor済み値を返す） */
+void uac2_audio_get_crc_stats(uint32_t *crc, uint32_t *bytes)
+{
+  if (crc)   *crc   = g_audio_dma.crc_val ^ 0xFFFFFFFFu;
+  if (bytes) *bytes = g_audio_dma.crc_bytes;
+}
+
+/* 書込側監査カウンタの取得 */
+void uac2_audio_get_iso_stats(uint32_t *sum_bytes, uint32_t *sum_calls)
+{
+  if (sum_bytes) *sum_bytes = g_audio_dma.iso_sum_bytes;
+  if (sum_calls) *sum_calls = g_audio_dma.iso_sum_calls;
+}
+
+/* Rev81-diag (一時): intakeキャプチャの取得 (MONスレッドが変化時のみ表示) */
+void uac2_audio_get_cap(const uint8_t **head, const uint8_t **frozen,
+                        const uint8_t **roll, bool *hv, bool *fv)
+{
+  if (head)   *head   = g_audio_dma.cap_head;
+  if (frozen) *frozen = g_audio_dma.cap_frozen;
+  if (roll)   *roll   = g_audio_dma.cap_roll;
+  if (hv)     *hv     = g_audio_dma.cap_head_valid;
+  if (fv)     *fv     = g_audio_dma.cap_frozen_valid;
+}
+
+/* 音質確保：ポンプ内UART撤去に伴うMON表示用ゲッター（安価なvolatile読取のみ） */
+void uac2_audio_get_mon_events(uint32_t *pump_wakes,
+                               uint32_t *newstream, uint32_t *leftover,
+                               uint32_t *fluke, uint32_t *revived,
+                               uint32_t *failed, uint32_t *enq_fail)
+{
+  if (pump_wakes) *pump_wakes = g_audio_dma.pump_wakes;
+  if (newstream)  *newstream  = g_audio_dma.mon_newstream;
+  if (leftover)   *leftover   = g_audio_dma.mon_newstream_leftover;
+  if (fluke)      *fluke      = g_audio_dma.mon_fluke_cancel;
+  if (revived)    *revived    = g_audio_dma.mon_restart_revived;
+  if (failed)     *failed     = g_audio_dma.mon_restart_failed;
+  if (enq_fail)   *enq_fail   = g_audio_dma.mon_enq_fail;
 }
 
 /* Legacy entry points */
