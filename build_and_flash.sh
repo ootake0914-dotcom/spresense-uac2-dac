@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "=== Building Spresense UAC2 192kHz/24bit DAC (Phase 1: Enumeration) ==="
+echo "=== Building Spresense UAC2 192kHz/24bit DAC (Rev85: DMA playback + ASMP + DCD ISOC patch) ==="
 TOOLS_ROOT="${SPRESENSE_TOOLS:-$HOME/spresense-tools}"
 export PATH="$TOOLS_ROOT/gcc-arm-none-eabi-9-2020-q2-update/bin:$HOME/spresenseenv/usr/bin:/usr/bin:/bin"
 
@@ -57,8 +57,8 @@ grep -q "Isochronous (UAC2 Audio OUT)" "$NUTTX/arch/arm/src/cxd56xx/cxd56_usbdev
   { echo "[ERROR] DCD ISOC patch missing after apply"; exit 1; }
 
 # 2. Ensure required Kconfig options in nuttx/.config
-#    Phase 1 needs USB device controller + USBDEV core. ISOC EPs (Phase 2)
-#    are provided by the DCD patch applied above.
+#    USB device controller + USBDEV core for enumeration; ISOC EPs,
+#    DMA playback, ASMP telemetry are provided by the DCD patch + app.
 if [ ! -f "$DOTCONFIG" ]; then
     echo "[ERROR] $DOTCONFIG not found. Run tools/config.py first (e.g. ./tools/config.py default)."
     exit 1

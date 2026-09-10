@@ -1,14 +1,27 @@
 diff --git a/arch/arm/src/cxd56xx/cxd56_usbdev.c b/arch/arm/src/cxd56xx/cxd56_usbdev.c
-index f725a55b54..7862e309d1 100644
+index f725a55b54..bbc311745e 100644
 --- a/arch/arm/src/cxd56xx/cxd56_usbdev.c
 +++ b/arch/arm/src/cxd56xx/cxd56_usbdev.c
-@@ -567,13 +567,13 @@ static const struct cxd56_epinfo_s g_epinfo[CXD56_NENDPOINTS] =
+@@ -247,6 +247,11 @@ const struct trace_msg_t g_usb_trace_strings_deverror[] =
+ #define CXD56_EP0MAXPACKET       64   /* EP0 max packet size */
+ #define CXD56_BULKMAXPACKET      512  /* Bulk endpoint max packet */
+ #define CXD56_INTRMAXPACKET      64   /* Interrupt endpoint max packet */
++/* Rev86e (UAC2): EP1-IN carries 4B Q16.16 feedback. IN_EP_MAXPKTSIZE must
++ * match the UDC CSR maxpacket (manual 3.18.11.1.1); the BULK 512 here
++ * left the ISOC-IN pipe misprogrammed from hw-init (no unload/XFERDONE).
++ */
++#define CXD56_UAC2FBMAXPACKET    4    /* UAC2 feedback IN max packet */
+ #define CXD56_EP0BUFSIZE         64   /* EP0 max packet size */
+ #define CXD56_BULKBUFSIZE        1024 /* Bulk endpoint max packet */
+ #define CXD56_INTRBUFSIZE        64   /* Interrupt endpoint max packet */
+@@ -567,13 +572,13 @@ static const struct cxd56_epinfo_s g_epinfo[CXD56_NENDPOINTS] =
    },
    {
      CXD56_EPBULKIN0 | USB_DIR_IN, /* Logical endpoint number: 1 IN */
 -    USB_EP_ATTR_XFER_BULK,        /* Type: Bulk */
+-    CXD56_BULKMAXPACKET,          /* Max packet size */
 +    USB_EP_ATTR_XFER_ISOC,        /* Type: Isochronous (UAC2 Feedback) */
-     CXD56_BULKMAXPACKET,          /* Max packet size */
++    CXD56_UAC2FBMAXPACKET,        /* Max packet size (4B Q16.16 feedback) */
      CXD56_BULKBUFSIZE,            /* Buffer size */
    },
    {
@@ -18,7 +31,7 @@ index f725a55b54..7862e309d1 100644
      CXD56_BULKMAXPACKET,            /* Max packet size */
      CXD56_BULKBUFSIZE,              /* Buffer size */
    },
-@@ -839,6 +839,20 @@ static void cxd56_txdmacomplete(struct cxd56_ep_s *privep)
+@@ -839,6 +844,20 @@ static void cxd56_txdmacomplete(struct cxd56_ep_s *privep)
  
    DEBUGASSERT(IS_BS_DMA_DONE(desc));
  
@@ -39,7 +52,66 @@ index f725a55b54..7862e309d1 100644
    desc->status |= DESC_BS_HOST_BUSY;
  
    privreq = cxd56_rqpeek(privep);
-@@ -1900,6 +1914,16 @@ static int cxd56_usbinterrupt(int irq, void *context, void *arg)
+@@ -1505,10 +1524,16 @@ static inline void cxd56_ep0setup(struct cxd56_usbdev_s *priv)
+  *
+  ****************************************************************************/
+ 
++/* Rev86c-diag (temporary): EP1-IN interrupt accounting. Which status bits
++ * fire for isochronous IN? [0]=IN-token, [1]=XFERDONE, [2]=ISO_IN_DONE,
++ * [3]=BNA, [4]=HE, [5]=TXEMPTY, [6]=TDC. Read via debugger or the class
++ * driver extern below. Counters only: no behavior change.
++ */
++volatile uint32_t g_ep1_irq_cnt[8];
++
+ static int cxd56_epinterrupt(int irq, void *context)
+ {
+-  struct cxd56_usbdev_s *priv = &g_usbdev;
+-  struct cxd56_ep_s *privep;
++  struct cxd56_usbdev_s *priv = &g_usbdev;  struct cxd56_ep_s *privep;
+   uint32_t eps;
+   uint32_t stat;
+   uint32_t ctrl;
+@@ -1527,6 +1552,18 @@ static int cxd56_epinterrupt(int irq, void *context)
+             {
+               stat = getreg32(CXD56_USB_IN_EP_STATUS(n));
+ 
++              /* Rev86c-diag: EP1-IN accounting (no behavior change). */
++              if (n == 1)
++                {
++                  if (stat & USB_INT_IN)         g_ep1_irq_cnt[0]++;
++                  if (stat & USB_INT_XFERDONE)   g_ep1_irq_cnt[1]++;
++                  if (stat & USB_INT_ISO_IN_DONE) g_ep1_irq_cnt[2]++;
++                  if (stat & USB_INT_BNA)        g_ep1_irq_cnt[3]++;
++                  if (stat & USB_INT_HE)         g_ep1_irq_cnt[4]++;
++                  if (stat & USB_INT_TXEMPTY)    g_ep1_irq_cnt[5]++;
++                  if (stat & USB_INT_TDC)        g_ep1_irq_cnt[6]++;
++                }
++
+               if (stat & USB_INT_RCS)
+                 {
+                   /* Handle Clear_Feature */
+@@ -1596,8 +1633,18 @@ static int cxd56_epinterrupt(int irq, void *context)
+ 
+                   usbtrace(TRACE_INTDECODE(CXD56_TRACEINTID_IN), n);
+ 
+-                  ctrl = getreg32(CXD56_USB_IN_EP_CONTROL(n));
+-                  putreg32(ctrl | USB_SNAK, CXD56_USB_IN_EP_CONTROL(n));
++                  /* Rev86e (UAC2, manual Table USB-69 SNAK): never NAK an
++                   * ISOC endpoint that has data queued. NAK-with-data is a
++                   * forbidden state (no unload, no further IN interrupts ->
++                   * permanent silent stall); the XFERDONE path can never
++                   * run to clear it. Non-ISOC behavior unchanged.
++                   */
++                  if (g_epinfo[privep->epphy].attr != USB_EP_ATTR_XFER_ISOC ||
++                      cxd56_rqempty(privep))
++                    {
++                      ctrl = getreg32(CXD56_USB_IN_EP_CONTROL(n));
++                      putreg32(ctrl | USB_SNAK, CXD56_USB_IN_EP_CONTROL(n));
++                    }
+ 
+                   /* If IN request is ready, then send it. */
+ 
+@@ -1900,6 +1947,16 @@ static int cxd56_usbinterrupt(int irq, void *context, void *arg)
      {
        usbtrace(TRACE_INTDECODE(CXD56_TRACEINTID_SI), 0);
        status = getreg32(CXD56_USB_DEV_STATUS);
@@ -56,7 +128,7 @@ index f725a55b54..7862e309d1 100644
        memset(&ctrl, 0, USB_SIZEOF_CTRLREQ);
        ctrl.type     = USB_REQ_RECIPIENT_INTERFACE;
        ctrl.req      = USB_REQ_SETINTERFACE;
-@@ -1924,6 +1948,14 @@ static int cxd56_usbinterrupt(int irq, void *context, void *arg)
+@@ -1924,6 +1981,14 @@ static int cxd56_usbinterrupt(int irq, void *context, void *arg)
      {
        usbtrace(TRACE_INTDECODE(CXD56_TRACEINTID_SC), 0);
        status = getreg32(CXD56_USB_DEV_STATUS);
@@ -71,7 +143,7 @@ index f725a55b54..7862e309d1 100644
        memset(&ctrl, 0, USB_SIZEOF_CTRLREQ);
        ctrl.req      = USB_REQ_SETCONFIGURATION;
        ctrl.value[0] = USB_STATUS_CFG(status);
-@@ -2203,14 +2235,23 @@ static int cxd56_epconfigure(struct usbdev_ep_s *ep,
+@@ -2203,14 +2268,23 @@ static int cxd56_epconfigure(struct usbdev_ep_s *ep,
    udc |= maxpacket << 19;
    uinfo("UDC: %08" PRIx32 "\n", udc);
  
@@ -97,7 +169,7 @@ index f725a55b54..7862e309d1 100644
    /* Off STALL bit and enable receive */
  
    addr = USB_ISEPIN(ep->eplog) ? CXD56_USB_IN_EP_CONTROL(privep->epphy)
-@@ -2267,7 +2308,27 @@ static int cxd56_epdisable(struct usbdev_ep_s *ep)
+@@ -2267,7 +2341,27 @@ static int cxd56_epdisable(struct usbdev_ep_s *ep)
    /* Cancel any ongoing activity and reset the endpoint */
  
    flags = enter_critical_section();
@@ -123,6 +195,37 @@ index f725a55b54..7862e309d1 100644
 +    privep->stalled = 0;
 +  }
 +
-   cxd56_cancelrequests(privep);
-   leave_critical_section(flags);
-   return OK;
+     cxd56_cancelrequests(privep);
+     leave_critical_section(flags);
+     return OK;
+@@ -1623,6 +1668,29 @@ static int cxd56_epinterrupt(int irq, void *context)
+                    * packets.
+                    */
+ 
+                   putreg32(ctrl | USB_CNAK, CXD56_USB_IN_EP_CONTROL(n));
+                 }
+ 
++              if (stat & USB_INT_ISO_IN_DONE)
++                {
++                  /* Rev87c/d (UAC2): ISOC-IN completion. The CXD56 signals
++                   * an unloaded isochronous-IN transaction via ISO_IN_DONE
++                   * (bit 23, "current microframe complete"), NOT XFERDONE
++                   * (bulk-only). This branch never existed, so no ISOC-IN
++                   * request ever completed device-side (E2b: FB ok:1
++                   * done:0 stuck, host frozen at stream-start value, PI
++                   * loop open, servo-drop equilibrium). Mirrors the
++                   * XFERDONE path exactly (ungated: bulk EPs never raise
++                   * ISO_IN_DONE, so bulk behavior is untouched).
++                   * (No usbtrace ID added: trace table left frozen.)
++                   */
++                  ctrl = getreg32(CXD56_USB_IN_EP_CONTROL(n));
++                  putreg32(ctrl | USB_SNAK, CXD56_USB_IN_EP_CONTROL(n));
++
++                  putreg32(USB_INT_ISO_IN_DONE, CXD56_USB_IN_EP_STATUS(n));
++
++                  cxd56_txdmacomplete(privep);
++
++                  putreg32(ctrl | USB_CNAK, CXD56_USB_IN_EP_CONTROL(n));
++                }
++
+               if (stat & USB_INT_IN)

@@ -34,6 +34,12 @@
 #include "uac2_audio_dma.h"
 
 
+/* Rev86c-diag (temporary): EP1-IN interrupt accounting from the DCD
+ * (cxd56_usbdev.c g_ep1_irq_cnt). Tells us which status bits fire for
+ * isochronous IN: IN-token / XFERDONE / ISO_IN_DONE / BNA / HE / ...
+ */
+extern volatile uint32_t g_ep1_irq_cnt[8];
+
 /* UAC2 Class Driver State Structure */
 typedef struct
 {
@@ -45,6 +51,19 @@ typedef struct
   struct usbdev_req_s *outreq;      /* EP OUT Isochronous Request */
   struct usbdev_req_s *fbreq;       /* Feedback IN request */
   volatile bool fb_inflight;        /* Rev76: paced submit guard (ISR clears) */
+
+  /* Rev85: feedback double-buffer + submit accounting.
+   * The DMA-owned fbreq->buf must NEVER be touched while fb_inflight.
+   * uac2_feedback_update() (pump thread) only stages into fb_pending_q16;
+   * uac2_feedback_poll() copies pending -> HW buf at submit time (idle).
+   * Counters are volatile telemetry (no UART in steady state).
+   */
+  volatile uint32_t fb_pending_q16;   /* staged PI output (pump -> poll handoff) */
+  volatile bool fb_has_pending;     /* pending value waiting for submit */
+  volatile uint32_t fb_last_sent_q16; /* last value copied to HW buf */
+  volatile uint32_t fb_submit_ok;   /* EP_SUBMIT success count */
+  volatile uint32_t fb_submit_fail; /* EP_SUBMIT sync-failure count */
+  volatile uint32_t fb_complete_cnt;/* IN-complete callback count */
 
   uint8_t config;                   /* Current configuration value */
   uint8_t config_applied;           /* HW applied config (task context) */
@@ -202,32 +221,51 @@ static void uac2_fb_in_complete(struct usbdev_ep_s *ep,
    * a hyperactive controller cannot build an ISR resubmit storm.
    * Format (verified): HS Q16.16 LE, samples/microframe.
    * Nominal 192kHz = 24.0 = 0x00180000.
+   * Rev85: count completions for stuck-IN diagnosis (Rev83: IN never
+   * completes, DMA descriptor pristine, wire shows 4 zero bytes @1kHz).
    */
   if (g_uac2_dev.ep_fb && req == g_uac2_dev.fbreq)
     {
       g_uac2_dev.fb_inflight = false;
+      g_uac2_dev.fb_complete_cnt++;
     }
 }
 
-/* Rev76: async-feedback payload writer (pump thread, task context).
- * The IN-complete callback only resubmits and never touches the buffer,
- * so this lock-free store is safe (a torn 4B value self-corrects next ms).
+/* Rev85: async-feedback payload stager (pump thread, task context).
+ * Double-buffered: stages the PI output into fb_pending_q16 WITHOUT
+ * touching the DMA-owned fbreq->buf. The copy happens in
+ * uac2_feedback_poll() at submit time when no transfer is in flight.
+ * Overwriting fbreq->buf while fb_inflight would corrupt an active
+ * DMA transfer (future silicon where IN completions actually fire).
  */
 void uac2_feedback_update(uint32_t ff_q16)
 {
-  if (g_uac2_dev.fbreq)
-    {
-      g_uac2_dev.fbreq->buf[0] = (uint8_t)(ff_q16);
-      g_uac2_dev.fbreq->buf[1] = (uint8_t)(ff_q16 >> 8);
-      g_uac2_dev.fbreq->buf[2] = (uint8_t)(ff_q16 >> 16);
-      g_uac2_dev.fbreq->buf[3] = (uint8_t)(ff_q16 >> 24);
-    }
+  g_uac2_dev.fb_pending_q16 = ff_q16;
+  g_uac2_dev.fb_has_pending = true;
 }
 
-/* Rev82: paced feedback submitter (pump thread, task context, <=1kHz).
+/* Rev85: feedback submit telemetry (debugger / future MON wiring).
+ * Snapshot struct is frozen (ASMP ABI v3); expose via accessor so the
+ * stuck-IN state (ok>0, done==0) is observable without layout churn.
+ */
+void uac2_feedback_stats(uint32_t *ok, uint32_t *fail, uint32_t *done,
+                         bool *inflight, uint32_t *last_sent)
+{
+  if (ok)        *ok        = g_uac2_dev.fb_submit_ok;
+  if (fail)      *fail      = g_uac2_dev.fb_submit_fail;
+  if (done)      *done      = g_uac2_dev.fb_complete_cnt;
+  if (inflight)  *inflight  = g_uac2_dev.fb_inflight;
+  if (last_sent) *last_sent = g_uac2_dev.fb_last_sent_q16;
+}
+
+/* Rev85: paced feedback submitter (pump thread, task context, <=1kHz).
  * Submits the 4B Q16.16 payload only when streaming and no transfer is
  * in flight. The host polls EP1 every 1ms (bInterval=4); a missed poll
  * simply yields no data that interval (host interpolates).
+ * Fixes vs Rev84:
+ *   - EP_SUBMIT return checked: sync failure clears fb_inflight so the
+ *     next poll retries instead of wedging forever with inflight=true.
+ *   - Pending -> HW copy at submit time only (never touches in-flight buf).
  */
 void uac2_feedback_poll(void)
 {
@@ -245,16 +283,83 @@ void uac2_feedback_poll(void)
       return;
     }
 #endif
-  if (g_uac2_dev.is_streaming && g_uac2_dev.ep_fb && g_uac2_dev.fbreq &&
-      !g_uac2_dev.fb_inflight)
+  if (g_uac2_dev.is_streaming && g_uac2_dev.ep_fb && g_uac2_dev.fbreq)
     {
-      g_uac2_dev.fbreq->len = 4;
-      g_uac2_dev.fb_inflight = true;
+      /* Rev87e: ALWAYS refresh the HW buf with fresh PI output, even
+       * while a transfer is in flight. Rationale (E2b/87d proven):
+       * the CXD56 UDC auto-unloads isoc-IN polls from the FIFO with
+       * (almost) no CPU involvement: no XFERDONE, no ISO_IN_DONE, no
+       * completion ever (FBSTAT ok:1 done:0 stuck; wire shows the one
+       * submitted value repeated HZZZ at ~828 polls/s while the device
+       * sees ~3 IN-irqs/s). The only proven carrier of a NEW value to
+       * the FIFO is the ~3/s IN-irq -> wrrequest -> DMA cycle, which
+       * re-DMAs fbreq->buf. So the buf must track the PI output
+       * continuously; the submit stays single-shot (re-submit would
+       * double-queue a never-completing request: Rev76 wedge lesson).
+       * A torn 4B write racing the DMA is harmless (host interpolates,
+       * loop tau=4s). Fresh PI output only (pending flag).
+       */
+      if (g_uac2_dev.fb_has_pending)
+        {
+          uint32_t q = g_uac2_dev.fb_pending_q16;
+          g_uac2_dev.fb_has_pending = false;
+          g_uac2_dev.fbreq->buf[0] = (uint8_t)(q);
+          g_uac2_dev.fbreq->buf[1] = (uint8_t)(q >> 8);
+          g_uac2_dev.fbreq->buf[2] = (uint8_t)(q >> 16);
+          g_uac2_dev.fbreq->buf[3] = (uint8_t)(q >> 24);
+          g_uac2_dev.fbreq->len = 4;
+        }
+
+      if (!g_uac2_dev.fb_inflight)
+        {
+          uint32_t q;
+
+          /* Fresh PI output only: skip when the pump produced nothing
+           * new since the last submit (avoids re-sending a stale value).
+           * NOTE Rev87e: with buf refresh above, has_pending is usually
+           * false here; the submit below then re-sends the current buf.
+           */
+          q = (uint32_t)g_uac2_dev.fbreq->buf[0] |
+              ((uint32_t)g_uac2_dev.fbreq->buf[1] << 8) |
+              ((uint32_t)g_uac2_dev.fbreq->buf[2] << 16) |
+              ((uint32_t)g_uac2_dev.fbreq->buf[3] << 24);
+          g_uac2_dev.fb_inflight = true;
 #if UAC2_FB_SINGLE_SHOT
       s_fb_shot = true;
       UAC2_TPRINTF("[UAC2] FB single-shot submit (4B Q16.16)\n");
 #endif
-      EP_SUBMIT(g_uac2_dev.ep_fb, g_uac2_dev.fbreq);
+      {
+        int ret = EP_SUBMIT(g_uac2_dev.ep_fb, g_uac2_dev.fbreq);
+        if (ret < 0)
+          {
+            /* Sync failure: no completion will ever arrive, so release
+             * the slot immediately and re-stage for retry next poll.
+             * Rate-limited log (task context, error path only).
+             */
+            g_uac2_dev.fb_inflight = false;
+            g_uac2_dev.fb_pending_q16 = q;
+            g_uac2_dev.fb_has_pending = true;
+            g_uac2_dev.fb_submit_fail++;
+            if (g_uac2_dev.fb_submit_fail <= 3 ||
+                (g_uac2_dev.fb_submit_fail % 1000) == 0)
+              {
+                UAC2_TPRINTF("[UAC2] FB submit failed %lu (ret=%d)\n",
+                       (unsigned long)g_uac2_dev.fb_submit_fail, ret);
+              }
+          }
+        else
+          {
+            g_uac2_dev.fb_last_sent_q16 = q;
+            g_uac2_dev.fb_submit_ok++;
+            /* Rev86e: unconditional CNAK after arming data. The DCD only
+             * CNAKs on submit when txwait is already set; with NAK stuck
+             * from an earlier disable/SNAK and txwait clear, tokens stay
+             * silent-NAK'd forever. Data is armed => NAK must go.
+             */
+            *(volatile uint32_t *)0x4E200020UL |= (1u << 8);
+          }
+      }
+      }
     }
 #else
   /* Bring-up ladder < 2: never submit (ISO IN submit wedges this DCD).
@@ -321,6 +426,9 @@ static void uac2_resetconfig(Uac2Driver *priv)
     }
 
   priv->fb_inflight = false;
+  /* Rev85: drop staged value (stale PI across config change); keep
+   * submit/complete counters for cross-config diagnosis. */
+  priv->fb_has_pending = false;
 }
 
 static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
@@ -429,6 +537,23 @@ static void uac2_apply_config_task(Uac2Driver *priv)
       int ret = EP_CONFIGURE(priv->ep_fb, &epdesc, false);
       printf("[UAC2] EP1 IN configure -> %d\n", ret);
       fflush(stdout);
+      /* Rev86 (silicon manual 3.18.10.2.1 + CSR matching): EP_CONFIGURE
+       * programs UDC slot 1 with the STALE intf/alt latched in STATUS at
+       * config time (0/0), so IN tokens for the streaming interface (1/0)
+       * never reach EP1's logic: no IN ISR, no DMA, pristine descriptor,
+       * empty (len 0) completions on the wire. EP2-OUT only works because
+       * it is manually re-armed below with intf=1. Do the same for EP1:
+       * slot = EP1 IN + ISOC + cfg1 + intf1 + alt0 + maxpacket 4.
+       */
+      uac2_hw_arm_ep_csr(1, (1u | (1u << 4) | (1u << 5) | (1u << 7) |
+                             (1u << 11) | (0u << 15) | (4u << 19)));
+      printf("[UAC2] EP1 CSR armed (0x508) for intf=1/alt=0\n");
+      fflush(stdout);
+      /* Rev86d experiment (MAXPKTSIZE live poke) REMOVED: the value now
+       * comes from the DCD table (CXD56_UAC2FBMAXPACKET) programmed at
+       * hw-init. Single source of truth; live pokes mid-stream confuse
+       * the IP.
+       */
     }
 #endif
 
@@ -572,10 +697,25 @@ void uac2_driver_poll(void)
 {
   Uac2Driver *priv = &g_uac2_dev;
   uint8_t alt;
+  /* Rev86c-diag (temporary): EP1 IRQ accounting every ~5s while streaming. */
+  static uint32_t s_poll_ticks = 0;
 
   if (!priv->dev)
     {
       return;
+    }
+
+  if ((++s_poll_ticks % 50) == 0 && priv->is_streaming)
+    {
+      printf("[UAC2] EP1IRQ in:%lu xfer:%lu iso:%lu bna:%lu he:%lu txe:%lu tdc:%lu\n",
+             (unsigned long)g_ep1_irq_cnt[0],
+             (unsigned long)g_ep1_irq_cnt[1],
+             (unsigned long)g_ep1_irq_cnt[2],
+             (unsigned long)g_ep1_irq_cnt[3],
+             (unsigned long)g_ep1_irq_cnt[4],
+             (unsigned long)g_ep1_irq_cnt[5],
+             (unsigned long)g_ep1_irq_cnt[6]);
+      fflush(stdout);
     }
 
   /* Config bring-up first, always in task context (Rev78 SMP fix).
@@ -648,14 +788,39 @@ void uac2_driver_poll(void)
       EP_CONFIGURE(priv->ep_fb, &epdesc, true);
 
 #if (UAC2_FB_HW_ENABLE >= 2)
-      /* Rev76 lesson (see uac2_desc.h ladder): a single EP_SUBMIT on the
-       * ISO IN feedback EP wedges this DCD (no UART, no sound). Never
-       * submit below HW_ENABLE>=2, even on this legacy multi-alt path.
+      /* Rev85: same guards as uac2_feedback_poll() (Rev76 wedge lesson
+       * + Rev83 stuck-IN finding). Never touch HW buf while inflight;
+       * check EP_SUBMIT return so a sync failure retries next stream.
        */
-      if (priv->fbreq)
+      if (priv->fbreq && !priv->fb_inflight)
         {
+          if (priv->fb_has_pending)
+            {
+              uint32_t q = priv->fb_pending_q16;
+              priv->fb_has_pending = false;
+              priv->fbreq->buf[0] = (uint8_t)(q);
+              priv->fbreq->buf[1] = (uint8_t)(q >> 8);
+              priv->fbreq->buf[2] = (uint8_t)(q >> 16);
+              priv->fbreq->buf[3] = (uint8_t)(q >> 24);
+              priv->fb_last_sent_q16 = q;
+            }
+          /* Else: keep bind-time nominal already in HW buf. */
           priv->fbreq->len = 4;
-          EP_SUBMIT(priv->ep_fb, priv->fbreq);
+          priv->fb_inflight = true;
+          {
+            int fbret = EP_SUBMIT(priv->ep_fb, priv->fbreq);
+            if (fbret < 0)
+              {
+                priv->fb_inflight = false;
+                priv->fb_has_pending = true;
+                priv->fb_pending_q16 = priv->fb_last_sent_q16;
+                priv->fb_submit_fail++;
+              }
+            else
+              {
+                priv->fb_submit_ok++;
+              }
+          }
         }
 #endif
     }
@@ -719,6 +884,14 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
   priv->outreq = NULL;
   priv->fbreq  = NULL;
   priv->fb_inflight = false;
+  /* Rev85 double-buffer init: nominal staged nowhere yet; HW buf holds
+   * nominal until the first PI update stages a fresh value. */
+  priv->fb_pending_q16 = (24u << 16);
+  priv->fb_has_pending = false;
+  priv->fb_last_sent_q16 = (24u << 16);
+  priv->fb_submit_ok = 0;
+  priv->fb_submit_fail = 0;
+  priv->fb_complete_cnt = 0;
 
   /* Pre-allocate streaming requests here (task context): allocreq must
    * never run in EP0 setup (USB interrupt) context.

@@ -203,7 +203,13 @@ static volatile uint32_t g_diag_dst_sample = 0;
 #define UAC2_FB_NOMINAL_Q16  (24u << 16)   /* 192kHz: 24.0 samples/uframe */
 #define UAC2_FB_TARGET_B     (64u * 1024u) /* ring target level (bytes) */
 #define UAC2_FB_DEADBAND_B   1024          /* +/-1KB: zero intervention zone */
-#define UAC2_FB_CLAMP_LSB    8192          /* +/-0.125/uframe (+/-0.52%) */
+#define UAC2_FB_CLAMP_LSB    8192          /* +/-0.125/uframe (+/-0.52%).
+ * Rev86g: +/-16384 tried -> host pinned +1.2% on stale saturated values,
+ * ring hit wall (Over + servo chopping 24k frames). The feedback path
+ * delivers sporadically (bursts then stalls), so wide authority lets a
+ * stale HIGH value wreck playback. Narrow clamp keeps the loop railed
+ * HIGH but harmless: fast device drains the ring, servo idles, audio
+ * stays bit-perfect (proven). DO NOT widen without reliable delivery. */
 #define UAC2_FB_I_MAX        (4096L * 32768L)
 
 struct uac2_fb_pi_s
@@ -464,10 +470,15 @@ static void *uac2_audio_pump_thread(void *arg)
                 dt_ms = 50u;
               }
             fb_last = fb_now;
+#if UAC2_FB_NOMINAL_LOCK
+            /* Rev87-E1: hold exact nominal (drift probe, no regulation). */
+            g_fb_last_ff = UAC2_FB_LOCK_VALUE;
+#else
             g_fb_last_ff = uac2_fb_pi_update(
-                             &g_fb_pi,
-                             uac2_ringbuf_available_read(&g_pcm_ring),
-                             dt_ms);
+                               &g_fb_pi,
+                               uac2_ringbuf_available_read(&g_pcm_ring),
+                               dt_ms);
+#endif
             uac2_feedback_update(g_fb_last_ff);
             uac2_feedback_poll();
           }
@@ -552,18 +563,14 @@ static void *uac2_audio_pump_thread(void *arg)
             }
           else
             {
-          /* Rev84 (5): post-close fast path. quiet>=250 proves no traffic
-           * (a startup dip always has pc advancing, quiet~=0), so the
-           * 100ms fluke-gate below would only stall the pump (85ms ring!)
-           * and amplify the next stream into overruns. Skip straight to
-           * genuine recovery. Mid-stream behavior unchanged.
+          /* Rev84 (5) fast-path REMOVED (was: skip fluke-gate when
+           * quiet>=250). Reason: the gate's 100ms stall is HARMLESS
+           * post-close (quiet = no intake, nothing to overrun), while
+           * skipping it leaves a genuinely dead engine unrestored
+           * (observed: pump alive, CRC frozen, intake overruns, no
+           * revived/failed movement). Fluke-gate always runs; a dead
+           * engine gets its revive.
            */
-          if (quiet_wakes >= 250)
-            {
-              g_audio_dma.mon_fluke_cancel++;
-            }
-          else
-            {
           uint32_t g0 = g_audio_dma.dequeue_count;
           usleep(50000);
           drain_audio_msgs(g_audio_dma.mq);
@@ -587,7 +594,17 @@ static void *uac2_audio_pump_thread(void *arg)
           for (int t = 0; t < 300; t++)
             {
               drain_audio_msgs(g_audio_dma.mq);
-              if (!stopped_once &&
+              /* Rev85b: post-silence sleep/wake. quiet>=250 (no traffic)
+               * + underrun means the CXD5247 slept on sustained digital
+               * silence (metronomic ~5s episodes, ENQUEUE rejected while
+               * asleep, music streams immune). A sleeping engine needs
+               * START-only: AUDIOIOC_STOP here risks the SDK corner
+               * (STOPPING-complete ISR never comes -> STOP hangs the
+               * pump -> intake overruns + hard lockup + watchdog reboot,
+               * observed once). Mid-stream death (quiet small) keeps the
+               * full STOP for a genuine reset.
+               */
+              if (!stopped_once && quiet_wakes < 250 &&
                   (g_audio_dma.msg_complete > comp_entry ||
                    g_audio_dma.dequeue_count > deq_entry))
                 {
@@ -675,7 +692,6 @@ static void *uac2_audio_pump_thread(void *arg)
                 }
             }
             } /* end else (genuine flat death) */
-            } /* end else (mid-stream: run fluke gate; Rev84 (5)) */
             } /* end else (engine playing; Rev84 (5) stale-guard) */
         }
 

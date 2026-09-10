@@ -48,6 +48,19 @@
  */
 #define UAC2_SERVO_ENABLE           1
 
+/* Rev87-E1: nominal-lock test mode (drift measurement).
+ *   1 = force feedback to exact nominal 24.0 (host feeds precisely
+ *       192000 Hz); PI ignored. Ring slope then directly reveals the
+ *       true device/host rate mismatch. TEST ONLY (no regulation).
+ *   0 = normal PI regulation (product default).
+ */
+#define UAC2_FB_NOMINAL_LOCK          0
+/* Rev87-E2a: locked test value. Nominal=(24u<<16). Railed=+8192LSB(+0.52%).
+ * E1 used nominal (host tracked at -4ppm: delivery path proven for that
+ * value). E2a parks at the railed value to test host following upward.
+ */
+#define UAC2_FB_LOCK_VALUE  ((24u << 16) + 8192)
+
 int uac2_audio_init(uint32_t sample_rate, uint8_t bit_depth, uint8_t channels);
 int uac2_audio_start(void);
 int uac2_audio_stop(void);
@@ -107,13 +120,21 @@ void uac2_audio_get_mon_events(uint32_t *pump_wakes,
 
 /* Rev76: async-feedbackペイロード書込み（uac2_driver.cが実装。
  * pumpスレッドが1ms毎にPI出力Q16.16を渡す）
+ * Rev85: double-buffered stage only (DMA buf untouched while inflight).
  */
 void uac2_feedback_update(uint32_t ff_q16);
 
 /* Rev76: paced feedback submitter (uac2_driver.cが実装。
  * pumpスレッドが1ms毎に呼ぶ。streaming中かつ送出中でなければ4B送信）
+ * Rev85: EP_SUBMIT戻り値検査＋pending->HWコピーはidle時のみ。
  */
 void uac2_feedback_poll(void);
+
+/* Rev85: feedback submit telemetry (ok/fail/done/inflight/last).
+ * Snapshot ABI frozen (v3) のためaccessor経由で公開。
+ */
+void uac2_feedback_stats(uint32_t *ok, uint32_t *fail, uint32_t *done,
+                         bool *inflight, uint32_t *last_sent);
 
 /* Legacy wrappers (signatures frozen by uac2_main.c) */
 

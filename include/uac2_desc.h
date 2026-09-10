@@ -63,6 +63,11 @@
  *     ISOC-IN may need more than EP_CONFIGURE programs). Parked: the
  *     device runs open-loop + servo exactly as at level 1, with the
  *     submit path exercised and proven harmless.
+ * Rev85 hardening (submit path only; closed-loop still parked):
+ *   - EP_SUBMIT return checked (sync fail clears inflight + restages).
+ *   - Double-buffered payload (PI stages pending; HW buf copied at
+ *     submit-idle only; never overwrites an in-flight DMA buffer).
+ *   - Counters ok/fail/done via uac2_feedback_stats() (stuck = ok>0,done==0).
  *   SINGLE_SHOT=1 submits exactly one transfer per boot (wedge probe);
  *   =0 is full paced submit (current).
  */

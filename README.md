@@ -6,7 +6,7 @@
 [![PCM](https://img.shields.io/badge/PCM-192kHz_24--bit-purple.svg)]()
 [![Audio](https://img.shields.io/badge/Audio-Bit--Perfect-gold.svg)]()
 
-Turn a **Sony Spresense** (CXD5602 + CXD5247) into a **dedicated 192 kHz / 24-bit USB Audio Class 2.0 (UAC2) hi-res bit-perfect USB-DAC** with a custom NuttX device driver and firmware.
+Turn a **Sony Spresense** (CXD5602 + CXD5247) into a **dedicated 192 kHz / 24-bit USB Audio Class 2.0 (UAC2) hi-res USB-DAC** with a custom NuttX device driver and firmware.
 
 > [!CAUTION]
 > **Non-standard descriptor design (deliberate):** this firmware streams on **Alt-0 with endpoints populated** (`bAlternateSetting: 0`, `bNumEndpoints: 2`). The UAC2 spec requires Alt-0 to be zero-bandwidth, with streaming starting at Alt-1+. This was chosen because the CXD5602 USB device controller autonomously STALLs any `SET_INTERFACE` to Alt > 0 (hardware value-gating, confirmed by experiment), making spec-compliant Alt-1/Alt-2 streaming impossible on this silicon. Linux `snd-usb-audio` accepts Alt-0 streaming; Windows (`usbaudio2.sys`) and macOS may refuse to create an audio pin. **Linux / Raspberry Pi / Volumio only.**
@@ -16,7 +16,7 @@ Turn a **Sony Spresense** (CXD5602 + CXD5247) into a **dedicated 192 kHz / 24-bi
 ## Features
 
 - **192 kHz / 24-bit Native S-Master Output** — Direct audio rendering via Sony CXD5247 S-Master PWM full-digital amplifier at 192 kHz native clock.
-- **Bit-Perfect Direct Passthrough** — Host 24-in-32-bit PCM audio stream is fed directly into the audio DMA engine without software scaling, bit-shift truncation, or digital filtering (verified by live CRC32 audit, `raw == dst`).
+- **Direct MSB-Aligned Passthrough** — Host 24-in-32-bit PCM audio stream is fed directly into the audio DMA engine without software scaling, bit-shift truncation, or digital filtering. Bit-perfect (`raw == dst`, CRC-matched) **only under steady-state conditions: servo non-intervention (`svd/svu/dup/gap == 0`), volume 0 dB, mute off**; drop servo drops frames, dup servo repeats frames, and any volume/mute setting intentionally alters the output.
 - **Zero-Copy Direct-to-DMA Pipeline** — Eliminates intermediate staging buffers; the SPSC ring buffer feeds NuttX APB DMA audio buffers directly.
 - **Adaptive Clock-Drift Compensation** — Built-in drift compensation servo maintains a healthy ring buffer cushion (~64–70 KB) to absorb physical crystal offset indefinitely.
 - **8-Byte Stereo Frame Protection** — Enforces strict 8-byte frame boundary alignment under all conditions, preventing stereo phase issues.
@@ -98,7 +98,7 @@ python tools/record_serial.py 10 test_logs/spresense_serial.log
 | Parameter | Specification | Notes |
 | :--- | :--- | :--- |
 | **USB Class** | USB Audio Class 2.0 (High-Speed 480 Mbps) | CXD5602 integrated USB PHY |
-| **Fidelity** | **Bit-Perfect (100% Direct Passthrough)** | Verified via real-time CRC32 audit (`raw == dst`) |
+| **Fidelity** | **Direct passthrough (conditionally bit-perfect)** | 24-bit MSB-aligned, no DSP; bit-perfect only when `svd/svu/dup/gap == 0`, 0 dB, mute off (live CRC32 audit) |
 | **Sampling Rate** | 192.0 kHz (Fixed) | High-resolution audio |
 | **Bit Depth** | 24-bit PCM | In 32-bit container (Subslot: 4 bytes) |
 | **Channels** | 2 channels (Stereo) | Front Left / Front Right |
@@ -112,7 +112,7 @@ python tools/record_serial.py 10 test_logs/spresense_serial.log
 
 - **Linux (ALSA)**: Fully supported out of the box. Compatible with desktop Linux, Raspberry Pi, Volumio, and Android.
 - **Windows (Stock Driver)**: Windows stock `usbaudio2.sys` requires an alternate setting switch (Alt > 0) to start playback. Because the CXD5602 USB hardware autonomously STALLs Alt > 0 requests (silicon-level constraint), the stock driver cannot open audio endpoints directly. A user-mode WinUSB streaming PoC is available under `tools/win_poc/`.
-- **Clock Drift Handling**: Operates with standard Async descriptors while utilizing a resilient device-side drift compensation servo.
+- **Clock Drift Handling**: Async descriptors advertised (`0x05` + EP1 feedback). Feedback EP is configured and paced-submit is exercised (Rev85: submit-failure guard + double-buffered payload), but IN completions never arrive on this silicon (DMA descriptor stays pristine; host ignores the 4 zero bytes and holds nominal pacing). Effective drift absorption is the device-side drop/dup servo + 128 KiB ring — i.e. open-loop with live PI telemetry, not closed-loop.
 
 ---
 
