@@ -38,7 +38,9 @@
  * (cxd56_usbdev.c g_ep1_irq_cnt). Tells us which status bits fire for
  * isochronous IN: IN-token / XFERDONE / ISO_IN_DONE / BNA / HE / ...
  */
-extern volatile uint32_t g_ep1_irq_cnt[8];
+#if !UAC2_SYNC_ADAPTIVE
+__attribute__((weak)) volatile uint32_t g_ep1_irq_cnt[8] = {0};
+#endif
 
 /* UAC2 Class Driver State Structure */
 typedef struct
@@ -50,6 +52,7 @@ typedef struct
   struct usbdev_req_s *ctrlreq;     /* EP0 Control Request */
   struct usbdev_req_s *outreq;      /* EP OUT Isochronous Request */
   struct usbdev_req_s *fbreq;       /* Feedback IN request */
+  volatile bool out_inflight;       /* EP OUT request queue state guard */
   volatile bool fb_inflight;        /* Rev76: paced submit guard (ISR clears) */
 
   /* Rev85: feedback double-buffer + submit accounting.
@@ -94,6 +97,11 @@ typedef struct
 static Uac2SetupLog g_setup_logs[UAC2_LOG_SIZE];
 static volatile uint16_t g_log_head = 0;
 static volatile uint16_t g_log_tail = 0;
+
+/* E2b diag (read-only): counts DCD SI-synthesized SET_INTERFACE calls
+ * (dataout == NULL path). Printed from task context in uac2_driver_poll.
+ */
+volatile uint32_t g_uac2_si_synth_cnt = 0;
 
 static inline void uac2_log_setup(uint8_t type, uint8_t req, uint16_t value,
                                   uint16_t index, uint16_t len, int16_t ret)
@@ -150,12 +158,11 @@ static void uac2_ep0_complete(struct usbdev_ep_s *ep,
 
 static uint16_t uac2_alt_packet_size(uint8_t alt)
 {
-#if UAC2_SINGLE_ALT0_STREAMING
-  return UAC2_PACKET_SIZE_24BIT_192K;
-#else
-  /* Alt1 = 16-bit PCM (100B max), Alt2 = 24-bit PCM in 32-bit slot (200B). */
-  return (alt == 1) ? UAC2_PACKET_SIZE_16BIT_192K : UAC2_PACKET_SIZE_24BIT_192K;
-#endif
+  if (alt == 1)
+    {
+      return UAC2_PACKET_SIZE_24BIT_48K; /* 56 bytes (48kHz 24-in-32bit) */
+    }
+  return UAC2_PACKET_SIZE_24BIT_192K;    /* 200 bytes (192kHz 24-in-32bit) */
 }
 
 static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
@@ -202,13 +209,16 @@ static void uac2_iso_out_complete(struct usbdev_ep_s *ep,
         }
     }
 
-  /* Re-queue the request for next packet. Buffer is sized for the max
-   * Alt (Alt2 24-bit: 200 B); smaller Alt1 (16-bit) packets fit inside.
-   */
+  /* Re-queue the request for next packet. Buffer is sized for 24-bit 200B. */
   if (g_uac2_dev.is_streaming && g_uac2_dev.ep_out && req == g_uac2_dev.outreq)
     {
       req->len = UAC2_ISO_OUT_MAXPKT;
+      g_uac2_dev.out_inflight = true;
       EP_SUBMIT(ep, req);
+    }
+  else
+    {
+      g_uac2_dev.out_inflight = false;
     }
 }
 
@@ -378,6 +388,13 @@ static void uac2_build_iso_out_desc(FAR struct usb_epdesc_s *epdesc, uint8_t alt
   epdesc->len  = USB_SIZEOF_EPDESC;
   epdesc->type = USB_DESC_TYPE_ENDPOINT;
   epdesc->addr = UAC2_EP_ISO_OUT;
+#if E3_BULK_ALT1
+  if (alt == 1)
+    {
+      epdesc->attr = 0x02; /* E3: Bulk (Alt-1 gate probe) */
+    }
+  else
+#endif
 #if UAC2_SYNC_ADAPTIVE
   epdesc->attr = 0x09; /* Isochronous, Adaptive */
 #else
@@ -410,6 +427,7 @@ static void uac2_resetconfig(Uac2Driver *priv)
 
   priv->is_streaming = false;
   priv->alt_setting  = 0;
+  priv->out_inflight = false;
 
   /* Disable streaming EPs if they were configured. Outstanding
    * transfers complete with -ESHUTDOWN.
@@ -461,9 +479,12 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
   priv->is_streaming = true;
   priv->alt_setting  = 0;
 #else
-  /* Multi-alt legacy: alt bring-up already deferred; just stage Alt-1. */
-  priv->is_streaming = true;
-  priv->alt_setting  = 1;
+  /* Multi-alt (W0/W1): Wait in Alt-0 (zero bandwidth standby).
+   * Do not advance to Alt-1 until the host sends SET_INTERFACE(alt=1).
+   */
+  priv->is_streaming = false;
+  priv->alt_setting  = 0;
+  priv->alt_applied  = 0;
 #endif
 
   priv->config = config;
@@ -564,8 +585,9 @@ static void uac2_apply_config_task(Uac2Driver *priv)
   uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
                       (1u << 11) | (0u << 15) | (200u << 19)); /* 0x064008A2 */
 #else
+  /* Pre-arm EP2 CSR for intf=1, alt=1, maxpacket=200 */
   uint32_t val_csr = (2u | (0u << 4) | (1u << 5) | (1u << 7) |
-                      (1u << 11) | (1u << 15) | (100u << 19)); /* 0x032088A2 */
+                      (1u << 11) | (1u << 15) | (200u << 19)); /* 0x064088A2 */
 #endif
 
   /* Arm EP2 OUT CSR slot (0x4E20050C = CXD56_USB_DEV_UDC_EP2) explicitly */
@@ -591,6 +613,55 @@ static void uac2_apply_config_task(Uac2Driver *priv)
    */
 #endif
   uac2_audio_start();
+#else
+#if E3_BULK_ALT1
+  /* E3: stock DCD path only (EP_CONFIGURE with BULK desc, no manual ISOC
+   * CSR arms that would overwrite the BULK programming). EP0 Alt-1
+   * pre-arm below is kept (proven inert).
+   */
+  priv->alt_applied = 0;
+  printf("[UAC2] E3: Alt-1 BULK config armed via stock EP_CONFIGURE\n");
+  fflush(stdout);
+#else
+  /* E1 experiment (Windows bring-up): pre-arm EP2 OUT READY (CNAK +
+   * request queued) at config time instead of SNAK-parked.
+   * Hypothesis: the CXD5602 UDC autonomously STALLs SET_INTERFACE to an
+   * Alt whose EP slot is SNAK-parked (gate fires pre-firmware: class
+   * driver never sees the setup, host gets EPIPE, Alt stays 0).
+   * Parking READY may let the status stage pass so the class driver can
+   * record the Alt. Alt-0 hosts never send ISO data (zero-bandwidth),
+   * so an armed EP2 is harmless until the host switches Alt.
+   */
+  volatile uint32_t *reg_ep2_out_ctl = (volatile uint32_t *)0x4E200240UL;
+  *reg_ep2_out_ctl = (*reg_ep2_out_ctl & ~(1u << 0)) | (1u << 8); /* ~STALL | CNAK */
+  if (priv->ep_out && priv->outreq && !priv->out_inflight)
+    {
+      priv->outreq->len = UAC2_ISO_OUT_MAXPKT; /* 200B cover-all */
+      priv->out_inflight = true;
+      EP_SUBMIT(priv->ep_out, priv->outreq);
+      printf("[UAC2] E1: EP2 OUT pre-armed READY (len=%u)\n",
+             (unsigned)priv->outreq->len);
+      fflush(stdout);
+    }
+  priv->alt_applied = 0;
+  printf("[UAC2] EP2 OUT pre-armed READY (waiting for SET_INTERFACE alt>0)\n");
+  fflush(stdout);
+#endif
+
+  /* E2 experiment (Windows bring-up): pre-arm the EP0 slot (0x504) for the
+   * Alt-1 target: 64B / cfg1 / intf1 / alt1.
+   * Theory: the CXD5602 UDC gates SET_INTERFACE in silicon on
+   * EP0-slot.alt == requested alt (INTF appears ignored: SET_IF(1,0)
+   * ACKs while slot alt is 0, but any Alt>0 EPIPEs pre-firmware and the
+   * class driver never sees the setup). The SC handler leaves the EP0
+   * slot at alt 0, so every Alt>0 STALLs. Pre-arming alt 1 should let
+   * SET_IF(1,1) through (Alt2 is expected to still EPIPE: one slot can
+   * only pre-arm one Alt -- differential proof of the theory).
+   */
+  uac2_hw_arm_ep_csr(0, (64u << 19) | (1u << 7) | (1u << 11) | (1u << 15));
+  printf("[UAC2] E2: EP0 slot pre-armed for Alt-1 (0x504 <- 0x%08lx)\n",
+         (unsigned long)((64u << 19) | (1u << 7) | (1u << 11) | (1u << 15)));
+  fflush(stdout);
 #endif
 
   priv->config_applied = priv->config;
@@ -648,7 +719,7 @@ static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
 #else
   if (alt > 2)
     {
-      return -EINVAL;
+      return -EINVAL; /* Multi-alt: only Alt-0 (idle), Alt-1 (48k), Alt-2 (192k) */
     }
 
   if (alt == priv->alt_setting && ((alt > 0) == priv->is_streaming))
@@ -656,32 +727,29 @@ static int uac2_setinterface(Uac2Driver *priv, uint8_t ifno, uint8_t alt)
       return 0;
     }
 
-  if (alt == 0)
-    {
-      /* Stop streaming request (ISR context: flags + SNAK only, NO STALL!).
-       * Note: NuttX EP_DISABLE() calls cxd56_epstall(false) which sets USB_STALL,
-       * causing hardware to STALL subsequent SET_INTERFACE(alt>0).
-       * Follow Linux pch_udc_ep_disable: set SNAK and clear STALL!
-       */
-      priv->is_streaming = false;
-      priv->alt_setting  = 0;
-
 #define CXD56_HW_USB_STALL (1u << 0)
 #define CXD56_HW_USB_SNAK  (1u << 7)
+#define CXD56_HW_USB_CNAK  (1u << 8)
+
+  if (alt == 0)
+    {
+      /* Stop streaming request (ISR context: set SNAK, never STALL). */
+      priv->is_streaming = false;
+      priv->alt_setting  = 0;
+      priv->out_inflight = false;
 
       *reg_ep2_out_ctl = (*reg_ep2_out_ctl & ~CXD56_HW_USB_STALL) | CXD56_HW_USB_SNAK;
-      *reg_ep1_in_ctl  = (*reg_ep1_in_ctl  & ~CXD56_HW_USB_STALL) | CXD56_HW_USB_SNAK;
 
       return 0;
     }
 
-  /* Alt-1 (16-bit PCM) / Alt-2 (24-bit PCM in 32-bit slot): record request.
-   * Hardware bring-up (EP_CONFIGURE/SUBMIT, audio_start, logging) runs
-   * deferred in uac2_driver_poll() task context: EP0 setup executes in USB
-   * interrupt context where printf/malloc/ISOC bring-up hung the MCU.
+  /* Alt-1 (48kHz) or Alt-2 (192kHz): clear STALL and CNAK immediately.
+   * Audio start and request arming will execute in uac2_driver_poll() task context.
    */
   priv->alt_setting  = alt;
   priv->is_streaming = true;
+
+  *reg_ep2_out_ctl = (*reg_ep2_out_ctl & ~CXD56_HW_USB_STALL) | CXD56_HW_USB_CNAK;
 
   return 0;
 #endif
@@ -705,6 +773,7 @@ void uac2_driver_poll(void)
       return;
     }
 
+#if !UAC2_SYNC_ADAPTIVE
   if ((++s_poll_ticks % 50) == 0 && priv->is_streaming)
     {
       printf("[UAC2] EP1IRQ in:%lu xfer:%lu iso:%lu bna:%lu he:%lu txe:%lu tdc:%lu\n",
@@ -717,6 +786,7 @@ void uac2_driver_poll(void)
              (unsigned long)g_ep1_irq_cnt[6]);
       fflush(stdout);
     }
+#endif
 
   /* Config bring-up first, always in task context (Rev78 SMP fix).
    * Covers the single-Alt-0 path: EP configure, CSR arm, pre-submit,
@@ -733,6 +803,45 @@ void uac2_driver_poll(void)
 
       uac2_apply_config_task(priv);
     }
+
+#if !UAC2_SINGLE_ALT0_STREAMING
+  /* E2d: EP0-slot Alt-gate pre-arm with BLIND writes only.
+   * UDC EP slots are WRITE-ONLY (DCD comment; reads HardFault with
+   * BFAR 0x4E200504 at uac2_driver.c:809). Never read 0x504/0x50C.
+   * Re-arm on shadow-state change and whenever an SI pass may have
+   * clobbered the slot (the DCD SI handler rewrites EP0 from STATUS):
+   * si_synth advance is the task-visible tripwire. While parked in
+   * Alt-0 aim at Alt-1; once streaming aim at Alt-0 for the release.
+   * NOTE: still gated on configured (USB MMIO needs USB up).
+   */
+  if (priv->config_applied == UAC2_CONFIG_ID)
+  {
+    static uint32_t s_gate_ticks = 0;
+    static uint32_t s_ep0_armed_alt = 0xFFFFFFFFu;
+    static uint32_t s_si_seen = 0;
+    uint32_t want_alt = priv->is_streaming ? 0u : 1u;
+    uint32_t si_now = g_uac2_si_synth_cnt;
+    if (s_ep0_armed_alt != want_alt || si_now != s_si_seen)
+      {
+        uint32_t want = (64u << 19) | (1u << 7) | (1u << 11) |
+                        (want_alt << 15);
+        uac2_hw_arm_ep_csr(0, want);
+        s_ep0_armed_alt = want_alt;
+        s_si_seen = si_now;
+        printf("[UAC2] E2d: ep0slot armed alt=%lu (si=%lu)\n",
+               (unsigned long)want_alt, (unsigned long)si_now);
+        fflush(stdout);
+      }
+    if ((++s_gate_ticks % 50) == 0)
+      {
+        printf("[UAC2] E2d: armed=%lu want=%lu si=%lu stream=%u alt=%u\n",
+               (unsigned long)s_ep0_armed_alt, (unsigned long)want_alt,
+               (unsigned long)si_now,
+               (unsigned)priv->is_streaming, (unsigned)priv->alt_setting);
+        fflush(stdout);
+      }
+  }
+#endif
 
   if (priv->alt_setting == priv->alt_applied)
     {
@@ -753,21 +862,22 @@ void uac2_driver_poll(void)
 
   if (priv->ep_out)
     {
-      struct usb_epdesc_s epdesc;
-      uac2_build_iso_out_desc(&epdesc, alt);
-      printf("[UAC2] ep_out configure (alt %u, pkt %u)\n",
-             (unsigned)alt, (unsigned)uac2_alt_packet_size(alt));
-      fflush(stdout);
-      EP_CONFIGURE(priv->ep_out, &epdesc, false);
-      printf("[UAC2] ep_out configured\n");
-      fflush(stdout);
-
       if (priv->outreq)
         {
-          priv->outreq->len = uac2_alt_packet_size(alt);
-          EP_SUBMIT(priv->ep_out, priv->outreq);
-          printf("[UAC2] ep_out streaming armed\n");
-          fflush(stdout);
+          if (!priv->out_inflight)
+            {
+              priv->outreq->len = uac2_alt_packet_size(alt);
+              priv->out_inflight = true;
+              EP_SUBMIT(priv->ep_out, priv->outreq);
+              printf("[UAC2] ep_out streaming armed (len=%u)\n",
+                     (unsigned)priv->outreq->len);
+              fflush(stdout);
+            }
+          else
+            {
+              printf("[UAC2] ep_out streaming already active (inflight)\n");
+              fflush(stdout);
+            }
         }
       else
         {
@@ -861,6 +971,7 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
       uinfo("ISO OUT EP unavailable (expected pre-ISOC DCD patch)\n");
     }
 
+#if !UAC2_SYNC_ADAPTIVE
   priv->ep_fb = DEV_ALLOCEP(dev, UAC2_EP_FEEDBACK_IN_NUM, true,
                             USB_EP_ATTR_XFER_ISOC);
   if (priv->ep_fb)
@@ -871,11 +982,14 @@ static int uac2_bind(struct usbdevclass_driver_s *drvr,
     {
       uinfo("Feedback IN EP unavailable (expected pre-ISOC DCD patch)\n");
     }
+#else
+  priv->ep_fb = NULL;
+#endif
 
   /* Initialize audio state */
   priv->config       = 0;
   priv->config_applied = 0;
-  priv->sample_rate  = UAC2_SAMPLE_RATE_192K;
+  priv->sample_rate  = UAC2_SAMPLE_RATE_48K;
   priv->alt_setting  = 0;
   priv->alt_applied  = 0;
   priv->is_streaming = false;
@@ -991,55 +1105,50 @@ static int uac2_clock_source_request(Uac2Driver *priv,
             {
               uint32_t freq = priv->sample_rate;
               memcpy(ctrlreq->buf, &freq, 4);
+              UAC2_TPRINTF("[UAC2] CLK GET_CUR freq -> %lu\n", (unsigned long)freq);
               return 4;
             }
           else
             {
-              /* TEMP-DIAG Rev54: 非対応値もSTALLせず192kクランプACK。
-               * SET_CUR拒否STALL後のEP0リカバリ不全による焼き付き疑いの
-               * 切り分け。エンジンは192k固定のため実害なし（のはず）。
-               * RANGEは192k-only維持。
-               */
               if (dataout && outlen >= 4)
                 {
                   uint32_t newfreq;
                   memcpy(&newfreq, dataout, 4);
-                  if (newfreq == 192000)
+                  if (newfreq == UAC2_SAMPLE_RATE_48K || newfreq == UAC2_SAMPLE_RATE_192K)
                     {
                       priv->sample_rate = newfreq;
+                      UAC2_TPRINTF("[UAC2] CLK SET_CUR freq -> %lu (ACK)\n", (unsigned long)newfreq);
+                      return 0;
                     }
-                    else
-                      {
-                        UAC2_TPRINTF("[UAC2] SET_CUR freq %lu clamped to 192000 (no STALL)\n",
-                               (unsigned long)newfreq);
-                        priv->sample_rate = 192000;
-                      }
                 }
-
-              return 0;
+              UAC2_TPRINTF("[UAC2] CLK SET_CUR freq rejected\n");
+              return -EINVAL; /* STALL */
             }
         }
       else if (req == UAC2_CS_RANGE)
         {
-          /* Single discrete subrange: 192kHz native only.
-           * (Former 6-rate table was for Windows usbaudio2 compat;
-           * Windows path abandoned (CXD5602 Alt>0 HW stall), Linux-only now.
-           * Advertising other rates lets hosts (e.g. PipeWire 48k) open
-           * the device at a rate the fixed engine cannot serve.)
-           * One discrete rate: dMIN == dMAX == freq, dRES == 0
-           * (UAC2 spec ADC-2 Table 5-1 / Sec 5.2.1).
+          /* Two discrete subranges (48kHz and 192kHz, 26 bytes) for Windows usbaudio2.sys:
+           * wNumSubRanges = 2
+           * Subrange 1: 48000 Hz (0x0000BB80)
+           * Subrange 2: 192000 Hz (0x0002EE00)
            */
           static const uint8_t range_desc[] =
           {
-            0x01, 0x00,               /* wNumSubRanges: 1 */
+            0x02, 0x00,               /* wNumSubRanges: 2 */
 
-            /* Subrange 1: 192000 Hz (0x0002EE00, native) */
+            /* Subrange 1: 48000 Hz (0x0000BB80) */
+            0x80, 0xBB, 0x00, 0x00,   /* dMIN: 48000 */
+            0x80, 0xBB, 0x00, 0x00,   /* dMAX: 48000 */
+            0x00, 0x00, 0x00, 0x00,   /* dRES: 0 (discrete) */
+
+            /* Subrange 2: 192000 Hz (0x0002EE00) */
             0x00, 0xEE, 0x02, 0x00,   /* dMIN: 192000 */
             0x00, 0xEE, 0x02, 0x00,   /* dMAX: 192000 */
             0x00, 0x00, 0x00, 0x00    /* dRES: 0 (discrete) */
           };
 
           memcpy(ctrlreq->buf, range_desc, sizeof(range_desc));
+          UAC2_TPRINTF("[UAC2] CLK GET_RANGE freq -> 2 subranges 48k/192k (26B)\n");
           return sizeof(range_desc);
         }
     }
@@ -1048,6 +1157,7 @@ static int uac2_clock_source_request(Uac2Driver *priv,
       if (req == UAC2_CS_CUR && (ctrl->type & USB_REQ_DIR_IN))
         {
           ctrlreq->buf[0] = 0x01; /* Valid */
+          UAC2_TPRINTF("[UAC2] CLK GET_CUR valid -> 1\n");
           return 1;
         }
       else if (req == UAC2_CS_CUR)
@@ -1074,6 +1184,7 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
           if (ctrl->type & USB_REQ_DIR_IN)
             {
               ctrlreq->buf[0] = priv->mute[idx] ? 0x01 : 0x00;
+              UAC2_TPRINTF("[UAC2] FU GET_CUR mute(ch=%u) -> %u\n", (unsigned)ch, ctrlreq->buf[0]);
               return 1;
             }
           else
@@ -1084,6 +1195,7 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
                   priv->mute[1] = priv->mute[0];
                   priv->mute[2] = priv->mute[0];
                   uac2_audio_set_mute(priv->mute[0]);
+                  UAC2_TPRINTF("[UAC2] FU SET_CUR mute(ch=%u) -> %u\n", (unsigned)ch, priv->mute[0]);
                 }
 
               return 0;
@@ -1097,6 +1209,7 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
           if (ctrl->type & USB_REQ_DIR_IN)
             {
               memcpy(ctrlreq->buf, &priv->volume[idx], 2);
+              UAC2_TPRINTF("[UAC2] FU GET_CUR vol(ch=%u) -> %d\n", (unsigned)ch, (int)(int16_t)priv->volume[idx]);
               return 2;
             }
           else
@@ -1125,6 +1238,8 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
                     }
 
                   uac2_audio_set_volume(percent);
+                  UAC2_TPRINTF("[UAC2] FU SET_CUR vol(ch=%u) -> %d (%u%%)\n",
+                               (unsigned)ch, (int)raw_vol, (unsigned)percent);
                 }
 
               return 0;
@@ -1142,12 +1257,12 @@ static int uac2_feature_unit_request(Uac2Driver *priv,
           };
 
           memcpy(ctrlreq->buf, vol_range, sizeof(vol_range));
+          UAC2_TPRINTF("[UAC2] FU GET_RANGE vol(ch=%u) -> 8B\n", (unsigned)ch);
           return sizeof(vol_range);
         }
     }
 
   return -EOPNOTSUPP;
-
 }
 
 static int uac2_setup(struct usbdevclass_driver_s *drvr,
@@ -1218,11 +1333,16 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
                 break;
 
               case USB_DESC_TYPE_BOS:
+#if UAC2_SINGLE_ALT0_STREAMING
                 /* MS OS 2.0 entry point (needs bcdUSB >= 0x0201).
                  * Linux ignores the unknown platform capability.
                  */
                 memcpy(ctrlreq->buf, g_uac2_bos_desc, g_uac2_bos_desc_len);
                 ret = g_uac2_bos_desc_len;
+#else
+                /* Pure standard UAC2 (bcdUSB 0x0200): no BOS descriptor */
+                ret = -EINVAL;
+#endif
                 break;
 
               default:
@@ -1261,16 +1381,26 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
         case USB_REQ_SETINTERFACE:
           if ((type & USB_REQ_RECIPIENT_MASK) == USB_REQ_RECIPIENT_INTERFACE)
             {
-              /* Rev19 diag: log every SET_IF arrival. The CXD56 DCD calls
-               * CLASS_SETUP twice per SET_IF: once from EP0 SETUP (real
-               * packet values, dataout != NULL) and once from the USB_INT_SI
-               * ISR with HW-synthesized values from USB_DEV_STATUS
-               * (dataout == NULL). A synthesized alt > 2 returns -EINVAL
-               * and STALLs EP0 after the real path already ACKed.
+              /* Guard against DCD USB_INT_SI duplicate setup call (dataout == NULL).
+               * The real EP0 SETUP path (dataout != NULL) already processes state
+               * and sends the ZLP status response. The SI-synthesized callback must
+               * be ignored completely without modifying state or submitting to EP0.
                */
-              UAC2_TPRINTF("[UAC2] SET_IF if=%u alt=%u via=%s\n",
-                     (unsigned)index, (unsigned)value,
-                     dataout ? "ep0" : "SI-synth");
+              /* E2b diag (read-only): the SI-synthesized duplicate call used
+               * to return invisibly (TPRINTF is ISR-suppressed). Log it
+               * with a magic ret so the MON drain shows whether the DCD
+               * SI handler fires for Alt>0 attempts at all.
+               */
+              if (dataout == NULL)
+                {
+                  g_uac2_si_synth_cnt++;
+                  uac2_log_setup(type, req, value, index, len,
+                                 (int16_t)0x5A5A);
+                  return OK;
+                }
+
+              UAC2_TPRINTF("[UAC2] SET_IF if=%u alt=%u via=ep0\n",
+                     (unsigned)index, (unsigned)value);
               ret = uac2_setinterface(priv, (uint8_t)index, (uint8_t)value);
               UAC2_TPRINTF("[UAC2] SET_IF -> %d\n", ret);
             }
@@ -1349,14 +1479,16 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
                   if (req == UAC2_CS_CUR && (type & USB_REQ_DIR_IN))
                     {
 #if UAC2_SINGLE_ALT0_STREAMING
-                      /* Only Alt 0 is valid: bit 0 = 0x01 */
+                      /* Only Alt 0 is valid: bControlSize=1, bmValidAltSettings=0x01 */
                       ctrlreq->buf[0] = 0x01;
+                      ctrlreq->buf[1] = 0x01;
+                      ret = 2;
 #else
-                      /* Alt 0 (zero bandwidth), Alt 1 (16-bit PCM) and
-                       * Alt 2 (24-bit PCM) are valid: bits 0, 1, 2 = 0x07 */
-                      ctrlreq->buf[0] = 0x07;
+                      /* W13: bControlSize=1, bmValidAltSettings=0x07 (Alt 0, 1, 2 valid) */
+                      ctrlreq->buf[0] = 0x01;
+                      ctrlreq->buf[1] = 0x07;
+                      ret = 2;
 #endif
-                      ret = 1;
                     }
                 }
             }
@@ -1382,11 +1514,16 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
   /* MS vendor requests (WinUSB auto-bind; ISR context: memcpy only) */
   else if ((type & USB_REQ_TYPE_MASK) == USB_REQ_TYPE_VENDOR)
     {
+#if UAC2_SINGLE_ALT0_STREAMING
       if (req == UAC2_MS_VENDOR_CODE && index == UAC2_MSOS20_INDEX)
         {
           memcpy(ctrlreq->buf, g_uac2_msos20_set, g_uac2_msos20_set_len);
           ret = g_uac2_msos20_set_len;
         }
+#else
+      /* Pure standard UAC2 for Windows usbaudio2.sys: reject WinUSB descriptor */
+      ret = -EINVAL;
+#endif
     }
 
   /* Record to lock-free setup trace log */

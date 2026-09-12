@@ -12,11 +12,11 @@
 #include "uac2.h"
 
 #define UAC2_VENDOR_ID                0x054C /* Sony Corporation */
-#define UAC2_PRODUCT_ID               0x0CED /* Spresense UAC2 Hi-Res DAC (Rev 20: UDC alt2 arm) */
-#define UAC2_DEVICE_RELEASE_NUM       0x010D /* v1.13: Alt 0/1/2 multi-setting test */
+#define UAC2_PRODUCT_ID               0x0CF9 /* Spresense UAC2 Hi-Res DAC (W13: Multi-Alt 48k/192k) */
+#define UAC2_DEVICE_RELEASE_NUM       0x0120 /* v1.32: Multi-Alt 48k(Alt1 maxpkt=56) + 192k(Alt2 maxpkt=200) */
 
-/* Alt 0 Single-Setting Streaming Mode (bypasses hardware Alt > 0 autonomous STALL) */
-#define UAC2_SINGLE_ALT0_STREAMING    1
+/* Alt 0 Single-Setting Streaming Mode (0: enable Multi-Alt 0/1 for Windows usbaudio2) */
+#define UAC2_SINGLE_ALT0_STREAMING    0
 
 /* Entity IDs (Aligned with TinyUSB UAC2 Speaker layout) */
 #define UAC2_ENTITY_INPUT_TERMINAL    0x01
@@ -34,15 +34,22 @@
 #define UAC2_CONFIG_NCONFIGS          0x01
 #define UAC2_MXDESCLEN                256
 
-/* Sync type selector (Rev76: async is the product default).
+/* Sync type selector (W0/W1 test: Adaptive OUT, no Feedback EP).
  *   0 = Asynchronous OUT + Feedback IN (EP1, Q16.16 @1ms).
- *       Host paces packets from our PI-controlled feedback; device-side
- *       drop/dup servo stays as a safety net behind a wide deadband.
- *   1 = Adaptive OUT, no Feedback EP (fallback: host paces packets;
- *       ring buffer + device servo absorb drift. Flip back + rebuild +
- *       reflash if any host refuses explicit feedback).
+ *   1 = Adaptive OUT, no Feedback EP (host paces packets; device servo absorbs drift).
  */
-#define UAC2_SYNC_ADAPTIVE            0
+#define UAC2_SYNC_ADAPTIVE            1
+
+/* E3 diagnostic (1 build only): Alt-1 EP type ISOC -> BULK.
+ * Single-variable probe to distinguish "ISOC-specific gate" from
+ * "pure Alt-switch value gate". If SET_IF(1, BULK) ACKs while
+ * SET_IF(1/2, ISOC) EPIPEs, the silicon gates ISOC Alt entry
+ * (global ISOC programming missing?) and the Windows path reopens.
+ * If BULK also EPIPEs, the gate is purely the Alt number and UAC
+ * streaming Alt entry is impossible on this silicon: stop and go
+ * Linux-only. Control-transfer probes only (no BULK streaming).
+ */
+#define E3_BULK_ALT1                  1
 
 /* Rev76 bring-up ladder for EP1 IN hardware (empirical results):
  *   0 = descriptors only: host plays briefly, then stops (no feedback).

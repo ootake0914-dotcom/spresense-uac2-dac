@@ -14,8 +14,12 @@ APP_SRC="$(cd "$(dirname "$0")" && pwd)"
 
 # Board serial port: explicit arg or UAC2_FLASH_PORT (fail fast, before build)
 PORT="${1:-${UAC2_FLASH_PORT:-}}"
-if [ -z "$PORT" ]; then
-    echo "[ERROR] No serial port given. Usage: $0 <serial-port>"
+BUILD_ONLY=0
+if [ "$1" = "--build-only" ] || [ "$PORT" = "none" ] || [ "$PORT" = "build" ]; then
+    BUILD_ONLY=1
+    echo "[MODE] Build-only mode; flash step will be skipped."
+elif [ -z "$PORT" ]; then
+    echo "[ERROR] No serial port given. Usage: $0 <serial-port> (or $0 --build-only)"
     echo "  Windows: Device Manager -> Ports (COM & LPT)"
     echo "  Linux:   ls /dev/ttyUSB*"
     echo "  Or set the UAC2_FLASH_PORT environment variable."
@@ -179,6 +183,12 @@ fi
 rm -f "$APP_SRC"/src/*.o
 
 # 4. Flash (port validated at startup)
+if [ "$BUILD_ONLY" = "1" ]; then
+    echo "=== Build Complete! (Flash skipped: --build-only) ==="
+    echo "Binary ready: $SDK/nuttx.spk"
+    exit 0
+fi
+
 echo "[FLASH] Flashing to Spresense on $PORT..."
 ./tools/flash.sh -c "$PORT" -b 115200 nuttx.spk
 

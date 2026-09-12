@@ -43,7 +43,7 @@ int main(int argc, char *argv[])
 #if UAC2_FB_NOMINAL_LOCK
     printf(" FW Rev87-LOCK: FB held test value (PI bypassed, TEST ONLY)\n");
 #else
-    printf(" FW Rev87e: FB buf always-fresh (3/s wrrequest carrier)\n");
+    printf(" FW E3: Alt-1 BULK gate probe (W13 base)\n");
 #endif
     printf(" Hardware: Sony CXD5602 + CXD5247 Audio Subsystem\n");
     printf(" Mode: Dedicated USB DAC Firmware (MIDI Engine Disabled)\n");
@@ -234,32 +234,6 @@ int main(int argc, char *argv[])
             }
 
             uac2_monitor_push(&snap);
-            /* Rev87-E2b: FB submit-path visibility (main thread, no ABI
-             * change, prints regardless of worker/local format path).
-             * ok>0,done==0 = completions dead (updates never reach wire).
-             * Rev87d: + EP1-IN IRQ truth (DCD counters): in/xfer/iso/bna/
-             * he/txempty/tdc. iso climbing + done==0 = txdmacomplete
-             * dropping (stale guard); iso==0 = HW never signals.
-             */
-            {
-              extern volatile uint32_t g_ep1_irq_cnt[8];
-              uint32_t ok = 0, fail = 0, done = 0, last = 0;
-              bool inflight = false;
-              uac2_feedback_stats(&ok, &fail, &done, &inflight, &last);
-              printf("[FBSTAT #%lu] ok:%lu fail:%lu done:%lu inflight:%d last:0x%08lx | ep1irq in:%lu xfer:%lu iso:%lu bna:%lu he:%lu txe:%lu tdc:%lu\n",
-                     (unsigned long)snap.tick_no,
-                     (unsigned long)ok, (unsigned long)fail,
-                     (unsigned long)done, (int)inflight,
-                     (unsigned long)last,
-                     (unsigned long)g_ep1_irq_cnt[0],
-                     (unsigned long)g_ep1_irq_cnt[1],
-                     (unsigned long)g_ep1_irq_cnt[2],
-                     (unsigned long)g_ep1_irq_cnt[3],
-                     (unsigned long)g_ep1_irq_cnt[4],
-                     (unsigned long)g_ep1_irq_cnt[5],
-                     (unsigned long)g_ep1_irq_cnt[6]);
-              fflush(stdout);
-            }
         }
     }
 

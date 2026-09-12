@@ -27,6 +27,7 @@
 
 #include <nuttx/audio/audio.h>
 #include <arch/board/board.h>
+#include <arch/board/cxd56_power.h>
 #include <arch/chip/audio.h>
 #include <arch/chip/irq.h>
 
@@ -48,6 +49,10 @@ extern bool cxd56_audio_clock_is_enabled(void);
 
 #define UAC2_AUDIO_NUM_BUFFERS      16
 #define UAC2_AUDIO_BUFFER_SIZE      2048   /* 256 frames @ 192kHz stereo 32-bit = 1.33ms */
+/* c: external-amp auto-mute idle threshold. Mute after this long with no
+ * USB packets (hiss killer for sensitive IEMs); instant unmute on resume.
+ */
+#define UAC2_AMP_IDLE_MUTE_MS       3000u
 /* ポンプスレッドのスタック：Rev75で中間chunk[2048]は全廃したが、
  * 割込みネストに備えて8192のまま余裕を持つ（縮小しない） */
 #define UAC2_PUMP_STACKSIZE         8192
@@ -423,6 +428,59 @@ static void *uac2_audio_pump_thread(void *arg)
         sem_timedwait(&g_audio_dma.pump_sem, &ts);
       }
       g_audio_dma.pump_wakes++;
+
+      /* c: external-amp auto-mute on idle (hiss killer for sensitive
+       * IEMs). Mute via the official API (150ms post-switch sleep is
+       * idle-safe) after UAC2_AMP_IDLE_MUTE_MS with no USB packets.
+       * Unmute via direct POWER_AUDIO_MUTE (the official unmute sleeps
+       * 1.25s, which would stall the pump and underrun the 85ms ring;
+       * the amp stays powered, only the mute gate moves, so the fast
+       * path is pop-safe in practice -- verify by ear). Transition-only
+       * UART (rare, never steady-state).
+       */
+      {
+        static bool amp_muted = false;
+        static uint32_t amp_last_pc = 0;
+        static struct timespec amp_last_ts = {0, 0};
+        static bool amp_ts_valid = false;
+        struct timespec amp_now;
+        uint32_t amp_pc = g_audio_dma.iso_pkt_count;
+
+        clock_gettime(CLOCK_MONOTONIC, &amp_now);
+        if (!amp_ts_valid)
+          {
+            amp_last_ts = amp_now;
+            amp_last_pc = amp_pc;
+            amp_ts_valid = true;
+          }
+
+        if (amp_pc != amp_last_pc)
+          {
+            amp_last_pc = amp_pc;
+            amp_last_ts = amp_now;
+            if (amp_muted)
+              {
+                board_power_control(POWER_AUDIO_MUTE, true);
+                amp_muted = false;
+                printf("[UAC2-AUDIO] Amp auto-unmute (stream resume)\n");
+                fflush(stdout);
+              }
+          }
+        else if (!amp_muted)
+          {
+            long amp_idle_ms =
+              (amp_now.tv_sec - amp_last_ts.tv_sec) * 1000L +
+              (amp_now.tv_nsec - amp_last_ts.tv_nsec) / 1000000L;
+            if (amp_idle_ms >= (long)UAC2_AMP_IDLE_MUTE_MS)
+              {
+                board_external_amp_mute_control(true);
+                amp_muted = true;
+                printf("[UAC2-AUDIO] Amp auto-mute (%ldms idle)\n",
+                       amp_idle_ms);
+                fflush(stdout);
+              }
+          }
+      }
 
       /* 音質確保：ポンプ内のUART定期報告は全廃（MONスレッドが1秒毎に表示）。
        * ここでは計数のみ。TX割込み・バス競合をオーディオ経路から排除する。 */

@@ -96,11 +96,17 @@
 #define UAC2_SUBSLOT_SIZE             UAC2_SUBSLOT_SIZE_24
 
 /* High-Speed Microframe Calculation (125us = 8000 Hz)
- * In Asynchronous mode (UAC2 FMT-2.0 2.3.1.1), wMaxPacketSize must include
+ * In Asynchronous/Adaptive mode (UAC2 FMT-2.0 2.3.1.1), wMaxPacketSize must include
  * +1 audio slot (sample) to accommodate host-side clock drift adjustment.
  * Nominally 192000 / 8000 = 24 samples. Max packet = 24 + 1 = 25 samples.
+ * Nominally 48000 / 8000 = 6 samples. Max packet = 6 + 1 = 7 samples.
  */
 #define UAC2_HS_MICROFRAME_HZ         8000u
+
+#define UAC2_NOMINAL_SAMPLES_48K      (UAC2_SAMPLE_RATE_48K / UAC2_HS_MICROFRAME_HZ)   /* 6 */
+#define UAC2_MAX_SAMPLES_48K          (UAC2_NOMINAL_SAMPLES_48K + 1u)                 /* 7 */
+#define UAC2_PACKET_SIZE_24BIT_48K    (UAC2_MAX_SAMPLES_48K * UAC2_CHANNELS * UAC2_SUBSLOT_SIZE_24) /* 56 bytes */
+
 #define UAC2_NOMINAL_SAMPLES_192K     (UAC2_SAMPLE_RATE_192K / UAC2_HS_MICROFRAME_HZ) /* 24 */
 #define UAC2_MAX_SAMPLES_192K         (UAC2_NOMINAL_SAMPLES_192K + 1u)               /* 25 */
 
