@@ -95,6 +95,13 @@ static Uac2SetupLog g_setup_logs[UAC2_LOG_SIZE];
 static volatile uint16_t g_log_head = 0;
 static volatile uint16_t g_log_tail = 0;
 
+/* Diag (read-only): counts DCD SI-synthesized SET_INTERFACE calls
+ * (dataout == NULL path), logged to the setup trace with magic ret
+ * 0x5A5A. Proved the CXD5602 SI fires for Alt-0 only on this silicon
+ * (Alt>0 STALLs pre-firmware). Kept as permanent lightweight USB debug.
+ */
+volatile uint32_t g_uac2_si_synth_cnt = 0;
+
 static inline void uac2_log_setup(uint8_t type, uint8_t req, uint16_t value,
                                   uint16_t index, uint16_t len, int16_t ret)
 {
@@ -482,6 +489,9 @@ static int uac2_setconfig(Uac2Driver *priv, uint8_t config)
  * Long-term these belong in the DCD (cxd56_usbdev.c via our ISOC patch),
  * but the DCD is SDK-owned, so isolation here is the pragmatic step.
  * USBDEV_BASE = 0x4E200000 (cxd5602_memorymap.h: ADSP_BASE + 0x220000).
+ * WARNING: UDC EP slots (0x504+) are WRITE-ONLY. READS bus-fault
+ * (HardFault, BFAR 0x4E200504, proven Sep 2026). Always blind-write +
+ * CSR_DONE; never read back.
  */
 #define UAC2_HW_USBDEV_BASE   0x4E200000UL
 #define UAC2_HW_USB_BUSY      (UAC2_HW_USBDEV_BASE + 0x808UL)
@@ -1271,6 +1281,12 @@ static int uac2_setup(struct usbdevclass_driver_s *drvr,
               UAC2_TPRINTF("[UAC2] SET_IF if=%u alt=%u via=%s\n",
                      (unsigned)index, (unsigned)value,
                      dataout ? "ep0" : "SI-synth");
+              if (dataout == NULL)
+                {
+                  g_uac2_si_synth_cnt++;
+                  uac2_log_setup(type, req, value, index, len,
+                                 (int16_t)0x5A5A);
+                }
               ret = uac2_setinterface(priv, (uint8_t)index, (uint8_t)value);
               UAC2_TPRINTF("[UAC2] SET_IF -> %d\n", ret);
             }
